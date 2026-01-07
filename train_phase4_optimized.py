@@ -391,12 +391,20 @@ def validate_training_setup(model, train_loader, criterion, optimizer):
     
     try:
         batch = next(iter(train_loader))
-        images, labels = batch
+        
+        # Handle 3-tuple (Phase 4) or 2-tuple (legacy)
+        if len(batch) == 3:
+            images, labels, masks = batch
+            masks = masks.to(DEVICE)
+        else:
+            images, labels = batch
+            masks = None
+        
         images = images.to(DEVICE)
         labels = labels.to(DEVICE)
         
         outputs = model(images)
-        loss = criterion(outputs, labels)
+        loss = criterion(outputs, labels, masks)  # Pass masks
         
         optimizer.zero_grad()
         loss.backward()
@@ -852,12 +860,13 @@ class CheXpertDataset(Dataset):
             return image, labels
 
 class NIHDataset(Dataset):
-    def __init__(self, csv_path, image_dir, transform=None, selected_labels=None, sample_size=None, patient_level_split=True):
+    def __init__(self, csv_path, image_dir, transform=None, selected_labels=None, sample_size=None, patient_level_split=True, return_masks=True):
         self.df = pd.read_csv(csv_path)
         self.image_dir = image_dir
         self.transform = transform
         self.selected_labels = selected_labels or SELECTED_LABELS
         self.fallback_count = 0  # Track missing images
+        self.return_masks = return_masks
         
         # NIH disease name mapping to our selected labels
         self.nih_to_selected = {
@@ -1235,7 +1244,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, epoc
             if labels_b is not None:
                 loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
             else:
-                loss = criterion(outputs, labels_a)
+                loss = criterion(outputs, labels_a, masks)  # Pass masks
             loss = loss / accum_in_window  # Use correct window size
             
             loss.backward()
@@ -1293,7 +1302,13 @@ def validate(model, loader, dataset_name=""):
     print(f"Validating on {dataset_name} ({len(loader.dataset)} samples)...")
     
     with torch.inference_mode():  # Faster than no_grad, lower memory overhead
-        for images, labels in tqdm(loader, desc=f"Validating {dataset_name}"):
+        for batch in tqdm(loader, desc=f"Validating {dataset_name}"):
+            # Handle 3-tuple or 2-tuple
+            if len(batch) == 3:
+                images, labels, _ = batch  # Ignore masks during validation
+            else:
+                images, labels = batch
+            
             use_non_blocking = (str(DEVICE) == "cuda" and PIN_MEMORY)
             images = images.to(DEVICE, non_blocking=use_non_blocking)
             
