@@ -250,7 +250,7 @@ def validate_paths():
     """Validate all required dataset paths exist"""
     critical_paths = [
         CHEXPERT_TRAIN_CSV,
-        CHEXPERT_VALID_CSV,
+        # CHEXPERT_VALID_CSV removed - not used in Phase 4 (we create our own splits)
         NIH_CSV_PATH,
         NIH_IMAGE_DIR,
         PNEUMONIA_ROOT
@@ -937,21 +937,16 @@ class NIHDataset(Dataset):
             # Exact match in pipe-separated list
             return self.df['Finding Labels'].str.contains(rf'(^|\|){lbl}(\||$)', regex=True)
         
-        # Map all 14 NIH diseases (exact names as they appear in CSV)
-        self.labels[:, LABEL_TO_IDX['Atelectasis']]       = has('Atelectasis').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Cardiomegaly']]      = has('Cardiomegaly').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Consolidation']]     = has('Consolidation').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Edema']]             = has('Edema').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Effusion']]          = has('Effusion').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Emphysema']]         = has('Emphysema').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Fibrosis']]          = has('Fibrosis').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Hernia']]            = has('Hernia').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Infiltration']]      = has('Infiltration').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Mass']]              = has('Mass').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Nodule']]            = has('Nodule').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Pleural_Thickening']]= has('Pleural_Thickening').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Pneumonia']]         = has('Pneumonia').astype(np.float32).values
-        self.labels[:, LABEL_TO_IDX['Pneumothorax']]      = has('Pneumothorax').astype(np.float32).values
+        # Map all 14 NIH diseases with correct CSV names
+        # CRITICAL: NIH CSV uses "Pleural Thickening" (space), not "Pleural_Thickening" (underscore)
+        NIH_NAME_MAP = {
+            "Pleural_Thickening": "Pleural Thickening"  # Map internal name to CSV name
+        }
+        
+        # Map all diseases dynamically
+        for disease in self.selected_labels:
+            csv_name = NIH_NAME_MAP.get(disease, disease)  # Use mapped name or original
+            self.labels[:, LABEL_TO_IDX[disease]] = has(csv_name).astype(np.float32).values
     
     def __len__(self):
         return len(self.df)
@@ -1167,13 +1162,36 @@ def create_model(num_classes=5):
         except TypeError:
             # Fallback for PyTorch < 1.13
             checkpoint = torch.load(BEST_CHECKPOINT, map_location="cpu")
-        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        state = checkpoint['model_state_dict']
+        
+        # Check if checkpoint is 5-class or 14-class
+        checkpoint_classes = None
+        if 'classifier.4.weight' in state:
+            checkpoint_classes = state['classifier.4.weight'].shape[0]
+            print(f"Checkpoint has {checkpoint_classes} output classes")
+        
+        if checkpoint_classes == num_classes:
+            # Same number of classes - load full model
+            model.load_state_dict(state)
+            print(f"Loaded full model (same {num_classes} classes)")
+        else:
+            # Different number of classes - load backbone only
+            filtered = {k: v for k, v in state.items() if not k.startswith('classifier.')}
+            missing, unexpected = model.load_state_dict(filtered, strict=False)
+            print(f"Loaded backbone only (checkpoint: {checkpoint_classes} classes -> model: {num_classes} classes)")
+            print(f"Classifier re-initialized for {num_classes} classes")
+            if missing:
+                print(f"  Missing keys: {len(missing)} items")
+            if unexpected:
+                print(f"  Unexpected keys: {len(unexpected)} items")
         
         # Resume training state for continuity
-        resume_info['start_epoch'] = checkpoint.get('epoch', 0) + 1
-        resume_info['best_auc'] = checkpoint.get('best_auc', 0.0)
-        resume_info['optimizer_state'] = checkpoint.get('optimizer_state_dict')
-        resume_info['scheduler_state'] = checkpoint.get('scheduler_state_dict')
+        # RESET start_epoch to 1 for Phase 4 bookkeeping
+        resume_info['start_epoch'] = 1  # Fresh start for Phase 4
+        resume_info['best_auc'] = 0.0   # Fresh best AUC for 14-class model
+        resume_info['optimizer_state'] = None  # Don't resume optimizer
+        resume_info['scheduler_state'] = None  # Don't resume scheduler
         
         # Safe formatting with default values
         epoch = checkpoint.get('epoch', 'Unknown')
@@ -2036,7 +2054,7 @@ def main():
                 with open(LOG_FILE, 'a') as f:
                     f.write(f"Epoch {epoch}/{end_epoch} | Train Loss: {train_loss:.4f} | "
                             f"NIH: {nih_auc:.4f} (Eff: {nih_eff_auc:.4f}) | CheXpert: {chexpert_auc:.4f} | "
-                            f"Pneumonia: {pneumonia_auc:.4f} (Cons: {pneu_cons_auc:.4f}) | "
+                            f"Pneumonia: {pneumonia_auc:.4f} (Pneu: {pneu_pneu_auc:.4f}) | "
                             f"Mean: {mean_auc:.4f} | MinCore: {min_auc_core:.4f} | MinGlobal: {min_auc:.4f}\n")
                 
                 print(f"{'='*70}")
@@ -2047,7 +2065,7 @@ def main():
                 print(f"CheXpert AUC:                {chexpert_auc:.4f}")
                 print(f"Pneumonia AUC:               {pneumonia_auc:.4f}")
                 print(f"Mean AUC:                    {mean_auc:.4f}")
-                print(f"Min AUC (Core 5):            {min_auc_core:.4f}")
+                print(f"Min AUC (Core 14):           {min_auc_core:.4f}")
                 print(f"Min AUC (Global):            {min_auc:.4f} <- CHECKPOINT (Best: {best_auc:.4f})")
                 print(f"Learning Rate:               {optimizer.param_groups[0]['lr']:.2e}")
                 print("="*70)
@@ -2071,13 +2089,13 @@ def main():
                         'chexpert_auc': chexpert_auc,
                         'pneumonia_auc': pneumonia_auc,
                         'nih_effusion_auc': nih_eff_auc,
-                        'pneumonia_consolidation_auc': pneu_cons_auc
+                        'pneumonia_pneumonia_auc': pneu_pneu_auc
                     }
                     
                     torch.save(checkpoint, BEST_MODEL_OUT)
                     print(f"\n🎉 NEW BEST MODEL SAVED! Min AUC: {min_auc:.4f}")
                     print(f"   Core (NIH+CheXpert 5 diseases): {min_auc_core:.4f}")
-                    print(f"   Pneumonia (Consolidation):      {pneu_cons_auc:.4f}")
+                    print(f"   Pneumonia (Pneumonia):          {pneu_pneu_auc:.4f}")
                     
                     # Clean up ALL emergency checkpoints after successful best model save
                     try:
