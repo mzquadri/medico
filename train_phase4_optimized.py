@@ -174,7 +174,7 @@ LOG_FILE = os.path.join(CHECKPOINT_DIR, 'training_log.txt')
 DETAILED_LOG_FILE = os.path.join(CHECKPOINT_DIR, 'training_log_detailed.json')
 
 # RESUME FROM BEST CHECKPOINT
-RESUME_FROM_BEST = False  # CHANGED: Train from scratch to avoid dead Effusion head carryover
+RESUME_FROM_BEST = True  # PHASE 4: Fine-tune from Phase 3 Epoch 16 checkpoint
 BEST_CHECKPOINT = r"checkpoints_phase3_fulldata\best_model_phase3_fulldata.pt"
 
 LOG_DIR = "logs_phase3"
@@ -773,7 +773,7 @@ class CheXpertDataset(Dataset):
         selected_labels: List of labels to use (default: SELECTED_LABELS)
         sample_size: Optional dataset size limit for debugging
     """
-    def __init__(self, csv_path, root_dir, transform=None, selected_labels=None, sample_size=None):
+    def __init__(self, csv_path, root_dir, transform=None, selected_labels=None, sample_size=None, return_masks=True):
         self.df = pd.read_csv(csv_path)
         if sample_size and sample_size < len(self.df):
             self.df = self.df.sample(n=sample_size, random_state=42).reset_index(drop=True)
@@ -782,6 +782,10 @@ class CheXpertDataset(Dataset):
         self.transform = transform
         self.selected_labels = selected_labels or SELECTED_LABELS
         self.fallback_count = 0  # Track missing images for debugging
+        self.return_masks = return_masks
+        
+        # CRITICAL: Store ORIGINAL labels before replacing -1→0 (needed for mask creation)
+        self.original_labels = self.df[self.selected_labels].copy()
         
         # Handle uncertain labels (-1) and NaN
         for label in self.selected_labels:
@@ -821,7 +825,17 @@ class CheXpertDataset(Dataset):
             # SPEEDUP FIX: Use precomputed labels (same as NIH dataset)
             labels = torch.from_numpy(self.labels[idx]).float()
             
-            return image, labels
+            if self.return_masks:
+                # Create mask from ORIGINAL labels: 1 for certain, 0 for uncertain (-1 or NaN)
+                mask = torch.ones(len(self.selected_labels), dtype=torch.float32)
+                for i, label in enumerate(self.selected_labels):
+                    if label in self.original_labels.columns:
+                        orig_val = self.original_labels.iloc[idx][label]
+                        if pd.isna(orig_val) or orig_val == -1:
+                            mask[i] = 0.0  # Ignore uncertain labels
+                return image, labels, mask
+            else:
+                return image, labels
             
         except Exception as e:
             # Return blank image as fallback - track for debugging
@@ -832,6 +846,9 @@ class CheXpertDataset(Dataset):
             if self.transform:
                 image = self.transform(image)
             labels = torch.zeros(len(self.selected_labels), dtype=torch.float32)
+            if self.return_masks:
+                mask = torch.ones(len(self.selected_labels), dtype=torch.float32)
+                return image, labels, mask
             return image, labels
 
 class NIHDataset(Dataset):
@@ -891,7 +908,12 @@ class NIHDataset(Dataset):
             # Use precomputed labels (much faster + consistent)
             labels = torch.from_numpy(self.labels[idx]).float()
             
-            return image, labels
+            if self.return_masks:
+                # NIH has no uncertain labels - all certain
+                mask = torch.ones(len(self.selected_labels), dtype=torch.float32)
+                return image, labels, mask
+            else:
+                return image, labels
             
         except Exception as e:
             # Return blank image as fallback
@@ -902,14 +924,18 @@ class NIHDataset(Dataset):
             if self.transform:
                 image = self.transform(image)
             labels = torch.zeros(len(self.selected_labels), dtype=torch.float32)
+            if self.return_masks:
+                mask = torch.ones(len(self.selected_labels), dtype=torch.float32)
+                return image, labels, mask
             return image, labels
 
 class PneumoniaDataset(Dataset):
-    def __init__(self, root_dir, split='train', transform=None):
+    def __init__(self, root_dir, split='train', transform=None, return_masks=True):
         self.root_dir = root_dir
         self.split = split
         self.transform = transform
         self.fallback_count = 0  # Track missing images
+        self.return_masks = return_masks
         
         split_dir = os.path.join(root_dir, split)
         self.image_paths = []
@@ -943,7 +969,12 @@ class PneumoniaDataset(Dataset):
             consolidation_idx = LABEL_TO_IDX.get('Consolidation', 2)  # Fallback to 2 if not found
             labels[consolidation_idx] = self.labels_list[idx]
             
-            return image, labels
+            if self.return_masks:
+                # Pneumonia has no uncertain labels - all certain
+                mask = torch.ones(len(SELECTED_LABELS), dtype=torch.float32)
+                return image, labels, mask
+            else:
+                return image, labels
             
         except Exception as e:
             # Return blank image as fallback
@@ -954,6 +985,9 @@ class PneumoniaDataset(Dataset):
             if self.transform:
                 image = self.transform(image)
             labels = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)
+            if self.return_masks:
+                mask = torch.ones(len(SELECTED_LABELS), dtype=torch.float32)
+                return image, labels, mask
             return image, labels
 
 # ============================================================================
@@ -1138,7 +1172,17 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, epoc
     
     pbar = tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}")
     
-    for batch_idx, (images, labels) in enumerate(pbar):
+    for batch_idx, batch in enumerate(pbar):
+        # Unpack with optional masks (3-tuple for Phase 4)
+        if len(batch) == 3:
+            images, labels, masks = batch
+            use_non_blocking = (str(DEVICE) == "cuda" and PIN_MEMORY)
+            masks = masks.to(DEVICE, non_blocking=use_non_blocking)
+        else:
+            # Fallback for 2-tuple (shouldn't happen in Phase 4)
+            images, labels = batch
+            masks = None
+        
         # non_blocking only safe on CUDA with pin_memory
         use_non_blocking = (str(DEVICE) == "cuda" and PIN_MEMORY)
         images = images.to(DEVICE, non_blocking=use_non_blocking)
@@ -1167,7 +1211,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, epoc
                 if labels_b is not None:
                     loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
                 else:
-                    loss = criterion(outputs, labels_a)
+                    loss = criterion(outputs, labels_a, masks)
                 loss = loss / accum_in_window  # Use correct window size
             
             scaler.scale(loss).backward()
@@ -1325,7 +1369,7 @@ def compute_min_auc(per_class_dicts):
 def main():
     try:
         print("\n" + "="*70)
-        print("PHASE 3 OPTIMIZED TRAINING")
+        print("PHASE 4: MASKED FINE-TUNING")
         print("="*70)
         
         # Validate all paths exist
@@ -1536,7 +1580,7 @@ def main():
         print_memory_info()
         
         # Optimizer and scheduler
-        criterion = SmoothedFocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA, smoothing=0.05)
+        criterion = MaskedSmoothedFocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA, smoothing=0.05)
         optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
         
         # CosineAnnealingWarmRestarts for better convergence
