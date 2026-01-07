@@ -527,6 +527,72 @@ def estimate_dataset_normalization(dataset, sample_size=1000):
         print("Warning: Could not calculate stats, using ImageNet defaults")
         return 0.485, 0.229
 
+def make_nih_patient_split_with_min_positives(nih_df, diseases, min_pos=20, max_tries=50, seed=42):
+    """
+    Create patient-level 80/10/10 split ensuring each disease has minimum positives in val/test.
+    
+    This prevents "single-class AUC = N/A" which would weaken min_auc optimization.
+    
+    Args:
+        nih_df: NIH DataFrame with 'Patient ID' and 'Finding Labels'
+        diseases: List of disease names to check
+        min_pos: Minimum positive samples per disease in val/test (default: 20)
+        max_tries: Maximum attempts to find valid split (default: 50)
+        seed: Random seed for reproducibility
+        
+    Returns:
+        tuple: (train_df, val_df, test_df) with guaranteed min positives
+    """
+    rng = np.random.RandomState(seed)
+    patients = nih_df['Patient ID'].unique()
+    
+    # Mapping for diseases with spaces in CSV (NIH uses "Pleural Thickening" not "Pleural_Thickening")
+    NIH_NAME_MAP = {
+        "Pleural_Thickening": "Pleural Thickening"
+    }
+    
+    def count_pos(df_part, disease):
+        """Count positive samples for disease in dataframe partition"""
+        csv_name = NIH_NAME_MAP.get(disease, disease)
+        return df_part['Finding Labels'].str.contains(rf'(^|\|){csv_name}(\||$)', regex=True, na=False).sum()
+    
+    for attempt in range(max_tries):
+        # Shuffle patients
+        rng.shuffle(patients)
+        n = len(patients)
+        tr_end, va_end = int(0.8 * n), int(0.9 * n)
+        
+        tr_p = set(patients[:tr_end])
+        va_p = set(patients[tr_end:va_end])
+        te_p = set(patients[va_end:])
+        
+        # Create splits
+        tr = nih_df[nih_df['Patient ID'].isin(tr_p)].copy()
+        va = nih_df[nih_df['Patient ID'].isin(va_p)].copy()
+        te = nih_df[nih_df['Patient ID'].isin(te_p)].copy()
+        
+        # Check if all non-rare diseases meet minimum
+        ok = True
+        for disease in diseases:
+            if disease == 'Hernia':  # Rare disease - skip minimum check
+                continue
+            
+            va_pos = count_pos(va, disease)
+            te_pos = count_pos(te, disease)
+            
+            if va_pos < min_pos or te_pos < min_pos:
+                ok = False
+                break
+        
+        if ok:
+            print(f"   Found valid split on attempt {attempt + 1}/{max_tries}")
+            return tr, va, te
+    
+    # Fallback: return last split if constraints can't be met
+    print(f"   WARNING: Could not meet min_pos={min_pos} constraint in {max_tries} tries")
+    print(f"   Using best-effort split (may have single-class AUCs)")
+    return tr, va, te
+
 def cleanup_temp_files():
     """Clean up temporary files and old checkpoints"""
     print("\nCleaning up temporary files...")
@@ -1268,11 +1334,17 @@ def create_model(num_classes=5):
         
         state = checkpoint['model_state_dict']
         
-        # Check if checkpoint is 5-class or 14-class
+        # ✅ ROBUST: Find last classifier Linear layer (handles any classifier structure)
         checkpoint_classes = None
-        if 'classifier.4.weight' in state:
-            checkpoint_classes = state['classifier.4.weight'].shape[0]
-            print(f"Checkpoint has {checkpoint_classes} output classes")
+        classifier_weights = [k for k in state.keys() if k.startswith('classifier.') and k.endswith('.weight')]
+        if classifier_weights:
+            # Sort by layer number and get last one
+            last_layer = sorted(classifier_weights, key=lambda s: int(s.split('.')[1]) if s.split('.')[1].isdigit() else 0)[-1]
+            checkpoint_classes = state[last_layer].shape[0]
+            print(f"Checkpoint has {checkpoint_classes} output classes (detected from {last_layer})")
+        else:
+            print("WARNING: Could not detect checkpoint output classes - assuming same as model")
+            checkpoint_classes = num_classes
         
         if checkpoint_classes == num_classes:
             # Same number of classes - load full model
@@ -1533,7 +1605,7 @@ def validate(model, loader, dataset_name=""):
     # Restore original training state instead of forcing train mode
     if was_training:
         model.train()
-    return mean_auc, per_class_aucs
+    return mean_auc, per_class_aucs, valid_diseases  # Return count for weighted averaging
 
 def compute_min_auc(per_class_dicts):
     """
@@ -1708,6 +1780,15 @@ def main():
             
             # Extract patient IDs from Path column (format: patient12345/study1/...)
             chexpert_df['Patient'] = chexpert_df['Path'].str.extract(r'(patient\d+)')
+            
+            # ✅ CRITICAL FIX: Drop rows with NaN patient IDs (prevents data leakage)
+            # NaN can occur if Path format is unexpected - must not leak into multiple splits
+            n_before = len(chexpert_df)
+            chexpert_df = chexpert_df.dropna(subset=['Patient']).reset_index(drop=True)
+            n_after = len(chexpert_df)
+            if n_before != n_after:
+                print(f"   WARNING: Dropped {n_before - n_after} rows with unparseable patient IDs")
+            
             patients = chexpert_df['Patient'].unique()
             
             # Shuffle and split patients 80/10/10
@@ -1743,6 +1824,33 @@ def main():
         chexpert_valid = CheXpertDataset('temp_chexpert_val.csv', CHEXPERT_ROOT, val_transform, SELECTED_LABELS)
         chexpert_test = CheXpertDataset('temp_chexpert_test.csv', CHEXPERT_ROOT, val_transform, SELECTED_LABELS)
         
+        # ✅ SANITY CHECK: Verify CheXpert Cardiomegaly has enough certain samples for stable AUC
+        print(f"\n{'='*70}")
+        print("CHEXPERT VALIDATION CARDIOMEGALY SANITY CHECK")
+        print(f"{'='*70}")
+        card_idx = LABEL_TO_IDX["Cardiomegaly"]
+        keep = chexpert_valid.masks[:, card_idx] == 1
+        y = chexpert_valid.labels[keep, card_idx]
+        pos_count = int((y == 1).sum())
+        neg_count = int((y == 0).sum())
+        total_certain = int(keep.sum())
+        total_samples = len(chexpert_valid)
+        
+        print(f"  Total samples:        {total_samples:6d}")
+        print(f"  Certain (mask=1):     {total_certain:6d} ({total_certain/total_samples*100:.1f}%)")
+        print(f"    - Positive:         {pos_count:6d} ({pos_count/max(1, total_certain)*100:.1f}% of certain)")
+        print(f"    - Negative:         {neg_count:6d} ({neg_count/max(1, total_certain)*100:.1f}% of certain)")
+        print(f"  Uncertain (mask=0):   {total_samples - total_certain:6d} ({(total_samples - total_certain)/total_samples*100:.1f}%)")
+        
+        if total_certain < 100:
+            print("\n  ⚠️  WARNING: <100 certain samples! Cardiomegaly AUC will be unstable")
+            print("     Consider: NaN → mask=0 (treat as unknown) instead of NaN → 0 (certain negative)")
+        elif pos_count < 20 or neg_count < 20:
+            print("\n  ⚠️  WARNING: <20 positives or negatives! AUC may be noisy")
+        else:
+            print("\n  ✅ Sufficient certain samples for stable AUC computation")
+        print(f"{'='*70}\n")
+        
         # --- NIH 80/10/10 Split (STRATIFIED) ---
         nih_fixed_train = os.path.join(CHECKPOINT_DIR, "nih_fixed_train.csv")
         nih_fixed_val = os.path.join(CHECKPOINT_DIR, "nih_fixed_val.csv")
@@ -1755,36 +1863,29 @@ def main():
             nih_test_df = pd.read_csv(nih_fixed_test)
         else:
             print(f"\n[NEW] Creating NEW NIH 80/10/10 STRATIFIED splits (patient-level)...")
-            print("   Strategy: Ensure minimum 30 val/test samples for rare diseases (Hernia, Pneumonia, Fibrosis)")
+            print("   Strategy: Resample until all non-rare diseases have ≥20 positives in val/test")
             nih_df = pd.read_csv(NIH_CSV_PATH)
             
-            # Patient-level stratified split
-            patients = nih_df['Patient ID'].unique()
-            np.random.seed(42)
-            np.random.shuffle(patients)
+            # ✅ CRITICAL FIX: Stratified split ensuring minimum positives per disease
+            # Prevents "N/A AUC" from weakening min_auc optimization
+            nih_train_df, nih_val_df, nih_test_df = make_nih_patient_split_with_min_positives(
+                nih_df,
+                diseases=SELECTED_LABELS,
+                min_pos=20,     # Minimum positives in val/test for stable AUC
+                max_tries=50,   # Attempt limit (usually finds valid split in <10 tries)
+                seed=42
+            )
             
-            # Standard 80/10/10 split on patients
-            n_patients = len(patients)
-            train_end = int(0.8 * n_patients)
-            val_end = int(0.9 * n_patients)
-            
-            train_patients = set(patients[:train_end])
-            val_patients = set(patients[train_end:val_end])
-            test_patients = set(patients[val_end:])
-            
-            nih_train_df = nih_df[nih_df['Patient ID'].isin(train_patients)].copy()
-            nih_val_df = nih_df[nih_df['Patient ID'].isin(val_patients)].copy()
-            nih_test_df = nih_df[nih_df['Patient ID'].isin(test_patients)].copy()
-            
-            # Verify minimum samples for rare diseases
-            rare_diseases = ['Hernia', 'Pneumonia', 'Fibrosis']
-            for disease in rare_diseases:
-                # Count samples containing this disease in val/test
-                val_count = nih_val_df['Finding Labels'].str.contains(disease, na=False).sum()
-                test_count = nih_test_df['Finding Labels'].str.contains(disease, na=False).sum()
-                print(f"   {disease}: Val={val_count}, Test={test_count} samples")
-                if val_count < 30 or test_count < 30:
-                    print(f"   [WARNING] {disease} has <30 samples in val or test (acceptable for rare disease)")
+            # Verify final counts
+            print(f"\n   Final disease counts (Val / Test):")
+            for disease in SELECTED_LABELS:
+                # Use same mapping as helper function
+                NIH_NAME_MAP = {"Pleural_Thickening": "Pleural Thickening"}
+                csv_name = NIH_NAME_MAP.get(disease, disease)
+                val_count = nih_val_df['Finding Labels'].str.contains(rf'(^|\|){csv_name}(\||$)', regex=True, na=False).sum()
+                test_count = nih_test_df['Finding Labels'].str.contains(rf'(^|\|){csv_name}(\||$)', regex=True, na=False).sum()
+                status = "✅" if (val_count >= 20 and test_count >= 20) or disease == 'Hernia' else "⚠️"
+                print(f"   {status} {disease:20s}: Val={val_count:4d}, Test={test_count:4d}")
             
             # Save fixed splits
             nih_train_df.to_csv(nih_fixed_train, index=False)
@@ -2243,15 +2344,15 @@ def main():
                 print("="*70)
                 
                 print("\nNIH Validation:")
-                nih_auc, nih_per_class = validate(model, nih_val_loader, "NIH")
+                nih_auc, nih_per_class, nih_valid_k = validate(model, nih_val_loader, "NIH")
                 nih_eff_auc = nih_per_class.get('Effusion')
                 nih_eff_auc = float(nih_eff_auc) if nih_eff_auc is not None else 0.0
                 
                 print("CheXpert Validation:")
-                chexpert_auc, chexpert_per_class = validate(model, chexpert_val_loader, "CheXpert")
+                chexpert_auc, chexpert_per_class, chex_valid_k = validate(model, chexpert_val_loader, "CheXpert")
                 
                 print("Pneumonia Validation:")
-                pneumonia_auc, pneumonia_per_class = validate(model, pneumonia_val_loader, "Pneumonia")
+                pneumonia_auc, pneumonia_per_class, pneu_valid_k = validate(model, pneumonia_val_loader, "Pneumonia")
                 
                 # PHASE 4 GOAL: Track Cardiomegaly AUC explicitly (main target for masking fix)
                 print(f"\n{'='*70}")
@@ -2278,7 +2379,11 @@ def main():
                 
                 print(f"{'='*70}\n")
                 
-                mean_auc = (nih_auc + chexpert_auc + pneumonia_auc) / 3
+                # ✅ CRITICAL FIX: Weight mean AUC by number of valid classes per dataset
+                # Prevents single-class Pneumonia from equally weighing with 14-class NIH
+                total_valid = max(1, nih_valid_k + chex_valid_k + pneu_valid_k)
+                mean_auc = (nih_auc * nih_valid_k + chexpert_auc * chex_valid_k + pneumonia_auc * pneu_valid_k) / total_valid
+                print(f"\n   Weighted Mean AUC: {mean_auc:.4f} (NIH: {nih_valid_k} classes, CheXpert: {chex_valid_k}, Pneumonia: {pneu_valid_k})\n")
                 
                 # CRITICAL FIX: Use NIH-only for min_auc (true 14-disease coverage)
                 # NIH is the ONLY dataset where all 14 diseases are actually labeled
