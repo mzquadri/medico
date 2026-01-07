@@ -1,18 +1,17 @@
 """
-PHASE 3: OPTIMIZED HIGH-PERFORMANCE TRAINING
-=============================================
-Professional-grade optimizations for maximum training efficiency:
+PHASE 4: MASKED FOCAL LOSS FINE-TUNING
+========================================
+Fine-tune Phase 3 checkpoint with uncertainty masking:
 
-1. Multi-worker data loading (4x faster)
-2. Prefetch factor optimization
-3. Aggressive batch size tuning
-4. Gradient checkpointing for memory efficiency
-5. Train from scratch (ImageNet init) to avoid dead Effusion head carryover
-6. Enhanced mixed precision training
-7. Efficient validation (every 2 epochs)
-8. Advanced learning rate scheduling
+1. MaskedSmoothedFocalLoss: Ignore uncertain (-1) labels in CheXpert
+2. Mask-aware mixup: Handle mixed masks correctly
+3. CheXpert NaN→0, -1→masked (not false negative)
+4. NIH & Pneumonia: Always return masks (all 1s)
+5. Fine-tune from Epoch 16 checkpoint
+6. Low LR (5e-6), low dropout (0.25), no mixup
+7. CPU-friendly: No gradient checkpointing
 
-Target: 85%+ AUC on all 5 diseases across CheXpert, NIH, and Pneumonia
+Target: Fix Cardiomegaly performance by handling uncertain labels correctly
 """
 
 import os
@@ -110,23 +109,23 @@ except ImportError:
 AMP_ENABLED = (HAS_AMP and str(DEVICE) == "cuda" and torch.cuda.is_available() and not IS_DIRECTML)
 
 # ============================================================================
-# OPTIMIZED CONFIGURATION
+# PHASE 4 FINE-TUNING CONFIGURATION
 # ============================================================================
-MODEL_VERSION = "3.0.0"
-MODEL_NAME = "ChestXray-DenseNet121-Phase3-Optimized"
+MODEL_VERSION = "3.1.0-finetune-masked"
+MODEL_NAME = "ChestXray-DenseNet121-Phase4-MaskedFineTune"
 
 SELECTED_LABELS = ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion"]
 LABEL_TO_IDX = {label: idx for idx, label in enumerate(SELECTED_LABELS)}  # Safe label indexing
 
-# AGGRESSIVE HYPERPARAMETERS
+# FINE-TUNING HYPERPARAMETERS (optimized for Phase 4)
 IMG_SIZE = 320
-BATCH_SIZE = 8             # Further reduced for DirectML stability
-ACCUMULATION_STEPS = 16      # Effective batch = 8 * 16 = 128
-LEARNING_RATE = 3e-5         # Optimized for fine-tuning
-EPOCHS = 30                  # Extended for full dataset convergence
-EARLY_STOPPING_PATIENCE = 15 # More patience for full dataset
-DROPOUT = 0.5
-MIXUP_ALPHA = 0.15           # Slightly reduced
+BATCH_SIZE = 8             # Keep same for consistency
+ACCUMULATION_STEPS = 16      # Effective batch = 128
+LEARNING_RATE = 5e-6         # REDUCED for fine-tuning (was 3e-5)
+EPOCHS = 15                  # Fine-tune epochs (resume from Epoch 16)
+EARLY_STOPPING_PATIENCE = 10 # Reduced patience
+DROPOUT = 0.25               # REDUCED from 0.5 (less regularization)
+MIXUP_ALPHA = 0.0            # DISABLED for fine-tuning (was 0.15)
 
 # DATA LOADING OPTIMIZATION
 # Windows spawn safety: limit workers to avoid hangs
@@ -498,10 +497,35 @@ def cleanup_temp_files():
         print(f"Warning: Checkpoint cleanup issue: {e}")
 
 # ============================================================================
-# FOCAL LOSS WITH LABEL SMOOTHING
+# MASKED FOCAL LOSS WITH LABEL SMOOTHING (PHASE 4)
 # ============================================================================
+class MaskedSmoothedFocalLoss(nn.Module):
+    """
+    Smoothed focal loss with optional masks (ignore uncertain labels).
+    masks: (N, C) with 1=certain, 0=ignore
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, smoothing=0.05):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.smoothing = smoothing
+
+    def forward(self, inputs, targets, masks=None):
+        targets_smoothed = targets * (1 - self.smoothing) + 0.5 * self.smoothing
+
+        bce = F.binary_cross_entropy_with_logits(inputs, targets_smoothed, reduction='none')
+        pt = torch.exp(-bce)
+        focal = self.alpha * (1 - pt) ** self.gamma * bce  # (N, C)
+
+        if masks is not None:
+            focal = focal * masks
+            denom = masks.sum().clamp_min(1e-6)
+            return focal.sum() / denom
+
+        return focal.mean()
+
 class SmoothedFocalLoss(nn.Module):
-    """Focal Loss with multi-label smoothing for better generalization"""
+    """Legacy: Focal Loss with multi-label smoothing (kept for compatibility)"""
     def __init__(self, alpha=0.25, gamma=2.0, smoothing=0.1):
         super().__init__()
         self.alpha = alpha
@@ -509,8 +533,6 @@ class SmoothedFocalLoss(nn.Module):
         self.smoothing = smoothing
     
     def forward(self, inputs, targets):
-        # Apply multi-label smoothing: smooth towards 0.5 instead of redistributing to other classes
-        # This prevents inflating false positives in multi-label scenario
         targets_smoothed = targets * (1 - self.smoothing) + 0.5 * self.smoothing
         
         bce_loss = F.binary_cross_entropy_with_logits(inputs, targets_smoothed, reduction='none')
