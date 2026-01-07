@@ -994,10 +994,14 @@ class CheXpertDataset(Dataset):
                 nih_idx = LABEL_TO_IDX[nih_name]
                 col_data = self.df[chexpert_name].to_numpy(dtype=np.float32)
                 
-                # Handle NaN and -1
-                col_data = np.nan_to_num(col_data, nan=0.0)  # NaN → 0 (negative)
-                self.masks[:, nih_idx] = (col_data != -1.0).astype(np.float32)  # -1 → masked
-                self.labels[:, nih_idx] = np.where(col_data == -1.0, 0.0, col_data)
+                # ✅ CRITICAL FIX: Mask both NaN (not mentioned) AND -1 (uncertain)
+                # Only certain labels (present AND not -1) get mask=1
+                mask = (~np.isnan(col_data)) & (col_data != -1.0)
+                self.masks[:, nih_idx] = mask.astype(np.float32)
+                
+                # Labels: use actual value where certain, 0 where masked (value irrelevant when mask=0)
+                col_clean = np.nan_to_num(col_data, nan=0.0)
+                self.labels[:, nih_idx] = np.where(mask, col_clean, 0.0).astype(np.float32)
         
         # CRITICAL FIX: CheXpert does NOT provide labels for remaining NIH diseases.
         # Treat them as "unknown", NOT as certain negatives (prevents false negative noise).
@@ -1720,6 +1724,80 @@ def compute_class_weights_mask_aware(nih_ds, chex_ds, pneu_ds, cap=10.0):
     print(f"{'='*70}\n")
     return torch.tensor(weights, dtype=torch.float32)
 
+def phase4_single_check(chex_train, chex_val, nih_train, nih_val, pneu_train, pneu_val):
+    """
+    Single comprehensive check for Phase-4 configuration.
+    Catches all silent failures that wreck Cardiomegaly AUC.
+    
+    This check validates:
+    1. Dataset shapes and mask binary values
+    2. CheXpert masks NIH-only diseases as unknown
+    3. Pneumonia dataset only supervises Pneumonia
+    4. NIH has all masks=1 (all certain)
+    5. CheXpert Cardiomegaly has enough certain samples
+    6. Masking is actually active (not ~0%)
+    
+    Raises RuntimeError if any check fails.
+    """
+    C = len(SELECTED_LABELS)
+    cardio = LABEL_TO_IDX["Cardiomegaly"]
+    pneu_i = LABEL_TO_IDX["Pneumonia"]
+
+    def ok(name, cond):
+        status = "✅" if cond else "❌"
+        print(f"{status} {name}")
+        if not cond:
+            raise RuntimeError(f"Phase-4 single check FAILED at: {name}")
+
+    print("\n" + "="*70)
+    print("PHASE-4 SINGLE CHECK")
+    print("="*70)
+
+    # 1) Shapes
+    ok("CheXpert labels shape", chex_train.labels.shape[1] == C and chex_val.labels.shape[1] == C)
+    ok("CheXpert masks shape", chex_train.masks.shape[1] == C and chex_val.masks.shape[1] == C)
+
+    # 2) Masks are binary-ish
+    ok("CheXpert masks in {0,1}", np.isin(np.unique(chex_train.masks), [0.0, 1.0]).all())
+
+    # 3) CheXpert: NIH-only diseases must be masked (unknown)
+    nih_only = ["Emphysema", "Fibrosis", "Hernia", "Infiltration", "Mass", "Nodule", "Pleural_Thickening"]
+    for d in nih_only:
+        j = LABEL_TO_IDX[d]
+        frac = float((chex_train.masks[:, j] == 0).mean())
+        ok(f"CheXpert masks NIH-only disease {d}", frac > 0.99)
+
+    # 4) Pneumonia dataset must supervise ONLY Pneumonia
+    # sample a few items to verify masks
+    for ds_name, ds in [("Pneumonia train", pneu_train), ("Pneumonia val", pneu_val)]:
+        for k in [0, min(10, len(ds)-1), min(50, len(ds)-1)]:
+            x = ds[k]
+            ok(f"{ds_name} returns 3-tuple", len(x) == 3)
+            _, _, m = x
+            m = m.numpy()
+            ok(f"{ds_name} only Pneumonia mask=1", (m.sum() == 1.0) and (m[pneu_i] == 1.0))
+
+    # 5) NIH must be all-certain (mask=1 everywhere)
+    for ds_name, ds in [("NIH train", nih_train), ("NIH val", nih_val)]:
+        for k in [0, min(10, len(ds)-1), min(50, len(ds)-1)]:
+            _, _, m = ds[k]
+            ok(f"{ds_name} all masks=1", float(m.min()) == 1.0 and float(m.max()) == 1.0)
+
+    # 6) CheXpert Cardiomegaly must have BOTH pos & neg among certain in VAL
+    keep = chex_val.masks[:, cardio] == 1
+    y = chex_val.labels[keep, cardio]
+    pos = int((y == 1).sum())
+    neg = int((y == 0).sum())
+    ok("CheXpert val Cardiomegaly has enough certain samples", int(keep.sum()) >= 100)
+    ok("CheXpert val Cardiomegaly has both classes", pos >= 20 and neg >= 20)
+
+    # 7) Masking actually active (not ~0% masked)
+    unc = float((chex_train.masks[:, cardio] == 0).mean())
+    ok("CheXpert train Cardiomegaly has some masked labels", unc >= 0.01)
+
+    print("✅ PHASE-4 SINGLE CHECK PASSED")
+    print("="*70 + "\n")
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -1749,10 +1827,10 @@ def main():
             print("✅ CLAHE enabled for training (CUDA device - sufficient CPU bandwidth)")
         else:
             print("⚠️  CLAHE disabled for training (Arc/DirectML/CPU - CPU bottleneck)")
-        print("   Validation always uses CLAHE for accurate metrics\n")
+        print("   Validation uses SAME preprocessing as training (no distribution shift)\n")
         
         train_transform = get_transforms(train=True, enable_clahe=enable_train_clahe)
-        val_transform = get_transforms(train=False, enable_clahe=True)
+        val_transform = get_transforms(train=False, enable_clahe=enable_train_clahe)  # ✅ Match training preprocessing
         
         # ============================================================================
         # OPTIMIZED SPLITS: NIH 80/10/10 (Stratified), CheXpert 80/10/10, Pneumonia 70/15/15
@@ -2270,6 +2348,9 @@ def main():
             },
             "epochs": []
         }
+        
+        # CRITICAL: Validate Phase-4 configuration before training
+        phase4_single_check(chexpert_train, chexpert_valid, nih_train, nih_valid, pneumonia_train, pneumonia_valid)
         
         # Load existing log if resuming
         if os.path.exists(DETAILED_LOG_FILE) and RESUME_FROM_BEST:
