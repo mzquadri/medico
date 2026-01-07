@@ -898,15 +898,23 @@ def get_transforms(train=True, enable_clahe=True):
         
         return transforms.Compose(transforms_list)
     else:
-        # Always use CLAHE for validation (fewer images, accurate metrics needed)
-        return transforms.Compose([
+        #  CRITICAL: Match training preprocessing to avoid distribution shift
+        # Validation must use SAME transforms as training (except data augmentation)
+        transforms_list = [
             transforms.Resize(256),  # Standard: 256 for 224 crops
-            # Center crop for validation to preserve anatomy
-            transforms.CenterCrop(IMG_SIZE),
-            CLAHETransform(clip_limit=2.0),
+            transforms.CenterCrop(IMG_SIZE),  # Center crop (no random crop for val)
+        ]
+        
+        # IMPORTANT: Only apply CLAHE if training also uses it (avoid train/val mismatch)
+        if enable_clahe:
+            transforms_list.append(CLAHETransform(clip_limit=2.0))
+        
+        transforms_list.extend([
             transforms.ToTensor(),
-            transforms.Normalize([0.485], [0.229])  # ImageNet-compatible stats for better transfer
+            transforms.Normalize([0.485], [0.229])  # ImageNet-compatible stats
         ])
+        
+        return transforms.Compose(transforms_list)
 
 def create_sampled_loader(dataset, batch_size, sample_size=3000):
     """
@@ -994,14 +1002,16 @@ class CheXpertDataset(Dataset):
                 nih_idx = LABEL_TO_IDX[nih_name]
                 col_data = self.df[chexpert_name].to_numpy(dtype=np.float32)
                 
-                # ✅ CRITICAL FIX: Mask both NaN (not mentioned) AND -1 (uncertain)
-                # Only certain labels (present AND not -1) get mask=1
-                mask = (~np.isnan(col_data)) & (col_data != -1.0)
+                # ✅ PHASE-4 SPEC: NaN → 0 (negative, still supervised), -1 → masked (ignored)
+                # This matches Phase-4 header: "CheXpert NaN→0, -1→masked (not false negative)"
+                # NaN samples are "not mentioned" → treat as usable negatives (common in medical datasets)
+                # Only -1 (uncertain) labels are ignored via mask=0
+                mask = (col_data != -1.0)  # NaN != -1.0 is True, so NaNs keep mask=1
                 self.masks[:, nih_idx] = mask.astype(np.float32)
                 
-                # Labels: use actual value where certain, 0 where masked (value irrelevant when mask=0)
+                # Labels: NaN → 0, -1 → 0 (but -1 masked so value irrelevant)
                 col_clean = np.nan_to_num(col_data, nan=0.0)
-                self.labels[:, nih_idx] = np.where(mask, col_clean, 0.0).astype(np.float32)
+                self.labels[:, nih_idx] = col_clean.astype(np.float32)
         
         # CRITICAL FIX: CheXpert does NOT provide labels for remaining NIH diseases.
         # Treat them as "unknown", NOT as certain negatives (prevents false negative noise).
@@ -1927,6 +1937,20 @@ def main():
             print("\n  ⚠️  WARNING: <20 positives or negatives! AUC may be noisy")
         else:
             print("\n  ✅ Sufficient certain samples for stable AUC computation")
+        print(f"{'='*70}\n")
+        
+        # ✅ DIAGNOSTIC: Verify NaN handling is correct (NaN → supervised, -1 → masked)
+        print(f"\n{'='*70}")
+        print("CHEXPERT NaN/UNCERTAINTY MASKING DIAGNOSTIC")
+        print(f"{'='*70}")
+        card_idx = LABEL_TO_IDX["Cardiomegaly"]
+        train_mask_rate = (chexpert_train.masks[:, card_idx] == 0).mean()
+        val_mask_rate = (chexpert_valid.masks[:, card_idx] == 0).mean()
+        
+        print(f"  CheXpert Train Cardiomegaly mask=0 rate: {train_mask_rate*100:.2f}%")
+        print(f"  CheXpert Val   Cardiomegaly mask=0 rate: {val_mask_rate*100:.2f}%")
+        print(f"\n  Expected: ~3-5% (only -1 uncertain labels, NOT NaN)")
+        print(f"  If >10%: NaN is being masked (WRONG - violates Phase-4 spec)")
         print(f"{'='*70}\n")
         
         # --- NIH 80/10/10 Split (STRATIFIED) ---
