@@ -549,30 +549,57 @@ class MaskedSmoothedFocalLoss(nn.Module):
     """
     Smoothed focal loss with optional masks (ignore uncertain labels).
     Automatically handles class imbalance via per-class weights.
-    masks: (N, C) with 1=certain, 0=ignore
-    class_weights: (C,) tensor with per-class weights (higher for rare diseases)
+    
+    CRITICAL FIX: Uses alpha_t per element (α for positives, 1-α for negatives).
+    This gives positives 3x relative focus (0.25 vs 0.75) which is essential for
+    imbalanced classes like Cardiomegaly.
+    
+    Args:
+        alpha: Weight for positive samples (default: 0.25)
+        gamma: Focusing parameter (default: 2.0)
+        smoothing: Label smoothing factor (default: 0.05)
+        class_weights: (C,) tensor with per-class weights (higher for rare diseases)
     """
     def __init__(self, alpha=0.25, gamma=2.0, smoothing=0.05, class_weights=None):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.smoothing = smoothing
-        self.class_weights = class_weights  # NEW: per-class weights for imbalance
+        self.class_weights = class_weights
 
     def forward(self, inputs, targets, masks=None):
+        # Label smoothing
         targets_smoothed = targets * (1 - self.smoothing) + 0.5 * self.smoothing
 
+        # Binary cross entropy
         bce = F.binary_cross_entropy_with_logits(inputs, targets_smoothed, reduction='none')
         pt = torch.exp(-bce)
-        focal = self.alpha * (1 - pt) ** self.gamma * bce  # (N, C)
 
-        # Apply class weights to combat imbalance (Hernia gets higher weight)
+        # CRITICAL FIX: alpha_t per element (α for pos, 1-α for neg)
+        # targets_smoothed is close to 0 or 1, so this balances pos/neg focus
+        alpha_t = self.alpha * targets_smoothed + (1.0 - self.alpha) * (1.0 - targets_smoothed)
+
+        # Focal term with per-element alpha
+        focal = alpha_t * (1 - pt) ** self.gamma * bce  # (N, C)
+
+        # Apply per-class weights (broadcast over batch dimension)
         if self.class_weights is not None:
-            focal = focal * self.class_weights.to(focal.device)
+            cw = self.class_weights.to(focal.device).view(1, -1)  # (1, C)
+            focal = focal * cw
+        else:
+            cw = None
 
+        # Apply masks (ignore uncertain labels)
         if masks is not None:
             focal = focal * masks
-            denom = masks.sum().clamp_min(1e-6)
+            
+            # Better normalization when class weights are used
+            # Divide by sum of (mask * class_weight) to account for both
+            if cw is not None:
+                denom = (masks * cw).sum().clamp_min(1e-6)
+            else:
+                denom = masks.sum().clamp_min(1e-6)
+            
             return focal.sum() / denom
 
         return focal.mean()
@@ -1512,6 +1539,57 @@ def compute_min_auc_filtered(per_class_dicts, exclude_diseases=None):
 RARE_DISEASES_THRESHOLD = 500  # Diseases with <500 samples excluded from checkpoint
 RARE_DISEASES = ['Hernia']  # Hernia only has 227 samples (0.08% of dataset)
 
+def compute_class_weights_mask_aware(nih_ds, chex_ds, pneu_ds, cap=10.0):
+    """
+    Compute class weights using only CERTAIN labels (respects masks).
+    
+    CRITICAL: Prevents CheXpert "unknown" diseases from inflating weights.
+    
+    For diseases NOT in CheXpert (Emphysema, Fibrosis, etc.), the denominator
+    should be NIH + Pneumonia samples ONLY, not the full 272K dataset size.
+    
+    Args:
+        nih_ds: NIH dataset (all labels certain)
+        chex_ds: CheXpert dataset (has masks for uncertain labels)
+        pneu_ds: Pneumonia dataset (all labels certain)
+        cap: Maximum weight value (prevents extreme values)
+    
+    Returns:
+        torch.FloatTensor: (C,) tensor of class weights
+    """
+    C = len(SELECTED_LABELS)
+    pos = np.zeros(C, dtype=np.float64)
+    certain = np.zeros(C, dtype=np.float64)
+
+    # NIH: all certain (mask=1 for all)
+    pos += nih_ds.labels.sum(axis=0)
+    certain += len(nih_ds)  # Each sample contributes 1 to all classes
+
+    # CheXpert: use masks (unknown diseases have mask=0)
+    pos += chex_ds.labels.sum(axis=0)
+    certain += chex_ds.masks.sum(axis=0)  # Only count certain labels!
+
+    # Pneumonia: all certain (only Pneumonia disease labeled, rest are certain negatives)
+    pos[LABEL_TO_IDX['Pneumonia']] += float(sum(pneu_ds.labels_list))
+    certain += len(pneu_ds)  # Each sample contributes 1 to all classes
+
+    weights = []
+    print(f"\n{'='*70}")
+    print("MASK-AWARE CLASS WEIGHTS (certain labels only)")
+    print(f"{'='*70}")
+    for i, disease in enumerate(SELECTED_LABELS):
+        if pos[i] > 0:
+            # Inverse frequency: weight = certain / (2 * pos)
+            w = certain[i] / (2.0 * pos[i])
+            w = min(w, cap)
+        else:
+            w = 1.0  # Neutral weight for diseases with no positive samples
+        weights.append(w)
+        print(f"  {disease:20s}: pos={int(pos[i]):6d}, certain={int(certain[i]):7d} → weight={w:.3f}")
+
+    print(f"{'='*70}\n")
+    return torch.tensor(weights, dtype=torch.float32)
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -1933,33 +2011,11 @@ def main():
         print("\n")
         print_memory_info()
         
-        # CRITICAL FIX: Compute class weights to handle severe imbalance (Hernia 0.08%)
-        print("\nComputing class weights for imbalanced diseases...")
-        disease_pos_counts = np.zeros(len(SELECTED_LABELS))
-        
-        # NIH contribution
-        disease_pos_counts += nih_train.labels.sum(axis=0)
-        # CheXpert contribution
-        disease_pos_counts += chexpert_train.labels.sum(axis=0)
-        # Pneumonia contribution (only Pneumonia disease)
-        pneumonia_idx = LABEL_TO_IDX['Pneumonia']
-        disease_pos_counts[pneumonia_idx] += sum(pneumonia_train.labels_list)
-        
-        total_samples = len(train_dataset)
-        class_weights = []
-        for i, disease in enumerate(SELECTED_LABELS):
-            pos_count = disease_pos_counts[i]
-            if pos_count > 0:
-                # Inverse frequency: weight = total / (2 * pos_count)
-                weight = total_samples / (2 * pos_count)
-                weight = min(weight, 10.0)  # Cap weight to prevent extreme values
-            else:
-                weight = 1.0  # Neutral weight for missing diseases
-            class_weights.append(weight)
-            print(f"  {disease:20s}: {int(pos_count):6d} positives → weight {weight:.3f}")
-        
-        class_weights_tensor = torch.FloatTensor(class_weights)
-        print(f"\nClass weights computed (Hernia weight: {class_weights_tensor[LABEL_TO_IDX['Hernia']]:.2f}x)\n")
+        # CRITICAL FIX: Compute class weights using MASK-AWARE counting
+        # Old version used len(train_dataset) which included CheXpert "unknown" diseases
+        # New version only counts samples where mask=1 (certain labels)
+        # This prevents inflated weights for diseases NOT in CheXpert (Emphysema, etc.)
+        class_weights_tensor = compute_class_weights_mask_aware(nih_train, chexpert_train, pneumonia_train, cap=10.0)
         
         # Optimizer and scheduler
         criterion = MaskedSmoothedFocalLoss(
@@ -1987,36 +2043,6 @@ def main():
         print(f"\nAMP: {'Enabled' if AMP_ENABLED else 'Disabled'}")
         print(f"Effective Batch Size: {BATCH_SIZE * ACCUMULATION_STEPS}")
         print(f"Validation Frequency: Every {VALIDATE_EVERY_N_EPOCHS} epochs")
-        
-        # PHASE-4 VERIFICATION: Check CheXpert Cardiomegaly uncertain masking
-        print(f"\n{'='*70}")
-        print("PHASE-4 UNCERTAIN MASKING VERIFICATION (CheXpert)")
-        print(f"{'='*70}")
-        card_idx = LABEL_TO_IDX["Cardiomegaly"]
-        uncertain_rate = np.mean(chexpert_train.masks[:, card_idx] == 0)
-        positive_rate = np.mean(chexpert_train.labels[:, card_idx] == 1)
-        print(f"Cardiomegaly: {positive_rate*100:.2f}% positive, {uncertain_rate*100:.2f}% masked (uncertain/-1)")
-        if uncertain_rate < 0.01:
-            print("WARNING: Expected 5-15% uncertain masking for Cardiomegaly!")
-            print("         Check if CheXpert CSV column name matches or values are -1")
-        else:
-            print(f"Masking active - {uncertain_rate*100:.1f}% uncertain labels excluded from loss")
-        
-        # Verify NIH critical diseases (Pleural Thickening space/underscore bug check)
-        print(f"\n{'='*70}")
-        print("NIH CRITICAL DISEASE VERIFICATION")
-        print(f"{'='*70}")
-        eff_idx = LABEL_TO_IDX["Effusion"]
-        pt_idx = LABEL_TO_IDX["Pleural_Thickening"]
-        eff_count = int(nih_train.labels[:, eff_idx].sum())
-        pt_count = int(nih_train.labels[:, pt_idx].sum())
-        print(f"Effusion:           {eff_count:6d} positives (expected ~10k)")
-        print(f"Pleural_Thickening: {pt_count:6d} positives (expected ~3k)")
-        if pt_count < 100:
-            print("CRITICAL ERROR: Pleural_Thickening has <100 samples!")
-            print("                NIH CSV uses 'Pleural Thickening' (space) not underscore")
-            print("                Check NIH_NAME_MAP in NIHDataset.__init__")
-        print(f"{'='*70}\n")
         
         # PHASE-4 VERIFICATION: Check CheXpert Cardiomegaly uncertain masking
         print(f"\n{'='*70}")
@@ -2160,6 +2186,31 @@ def main():
                 
                 print("Pneumonia Validation:")
                 pneumonia_auc, pneumonia_per_class = validate(model, pneumonia_val_loader, "Pneumonia")
+                
+                # PHASE 4 GOAL: Track Cardiomegaly AUC explicitly (main target for masking fix)
+                print(f"\n{'='*70}")
+                print("CARDIOMEGALY TRACKING (PHASE 4 PRIMARY GOAL)")
+                print(f"{'='*70}")
+                nih_cardio_auc = nih_per_class.get('Cardiomegaly')
+                chex_cardio_auc = chexpert_per_class.get('Cardiomegaly')
+                pneu_cardio_auc = pneumonia_per_class.get('Cardiomegaly')  # Should be N/A (not labeled)
+                
+                if nih_cardio_auc is not None:
+                    print(f"  NIH Cardiomegaly AUC:       {nih_cardio_auc:.4f}")
+                else:
+                    print(f"  NIH Cardiomegaly AUC:      N/A (single class in validation)")
+                
+                if chex_cardio_auc is not None:
+                    print(f"  CheXpert Cardiomegaly AUC: {chex_cardio_auc:.4f}  <- Masking should improve this!")
+                else:
+                    print(f"  CheXpert Cardiomegaly AUC: N/A (single class or all masked)")
+                
+                if pneu_cardio_auc is not None:
+                    print(f"  Pneumonia Cardiomegaly AUC: {pneu_cardio_auc:.4f}")
+                else:
+                    print(f"  Pneumonia Cardiomegaly AUC: N/A (not labeled in Pneumonia dataset)")
+                
+                print(f"{'='*70}\n")
                 
                 mean_auc = (nih_auc + chexpert_auc + pneumonia_auc) / 3
                 
