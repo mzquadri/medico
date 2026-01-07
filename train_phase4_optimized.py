@@ -122,7 +122,7 @@ IMG_SIZE = 320
 BATCH_SIZE = 8             # Keep same for consistency
 ACCUMULATION_STEPS = 16      # Effective batch = 128
 LEARNING_RATE = 5e-6         # REDUCED for fine-tuning (was 3e-5)
-EPOCHS = 15                  # Fine-tune epochs (resume from Epoch 16)
+FINETUNE_EPOCHS = 15         # How many NEW epochs to run after resume
 EARLY_STOPPING_PATIENCE = 10 # Reduced patience
 DROPOUT = 0.25               # REDUCED from 0.5 (less regularization)
 MIXUP_ALPHA = 0.0            # DISABLED for fine-tuning (was 0.15)
@@ -151,7 +151,7 @@ NIH_SAMPLE_SIZE = None       # Use all 112K images
 USE_FULL_PNEUMONIA = True    # Use all 5.2K images
 
 # Gradient Checkpointing (Memory Efficiency)
-USE_GRADIENT_CHECKPOINTING = True  # Enables checkpointing for DenseNet blocks
+USE_GRADIENT_CHECKPOINTING = False  # Disabled for Phase 4 (CPU-friendly fine-tuning)
 
 # Focal Loss
 FOCAL_ALPHA = 0.25
@@ -168,14 +168,17 @@ NIH_CSV_PATH = r"C:\Users\MohdZaminQuadri\Downloads\Medico-Xray\datasets\nih\Dat
 
 PNEUMONIA_ROOT = r"C:\Users\MohdZaminQuadri\Downloads\Medico-Xray\datasets\pneumonia"
 
-CHECKPOINT_DIR = "checkpoints_phase3_fulldata"
+PHASE3_DIR = "checkpoints_phase3_fulldata"
+CHECKPOINT_DIR = "checkpoints_phase4_masked"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
 LOG_FILE = os.path.join(CHECKPOINT_DIR, 'training_log.txt')
 DETAILED_LOG_FILE = os.path.join(CHECKPOINT_DIR, 'training_log_detailed.json')
 
 # RESUME FROM BEST CHECKPOINT
 RESUME_FROM_BEST = True  # PHASE 4: Fine-tune from Phase 3 Epoch 16 checkpoint
-BEST_CHECKPOINT = r"checkpoints_phase3_fulldata\best_model_phase3_fulldata.pt"
+BEST_CHECKPOINT = os.path.join(PHASE3_DIR, "best_model_phase3_fulldata.pt")
+BEST_MODEL_OUT = os.path.join(CHECKPOINT_DIR, "best_model_phase4_masked.pt")
 
 LOG_DIR = "logs_phase3"
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -273,7 +276,7 @@ def save_training_config():
         'BATCH_SIZE': BATCH_SIZE,
         'ACCUMULATION_STEPS': ACCUMULATION_STEPS,
         'LEARNING_RATE': LEARNING_RATE,
-        'EPOCHS': EPOCHS,
+        'FINETUNE_EPOCHS': FINETUNE_EPOCHS,
         'DROPOUT': DROPOUT,
         'MIXUP_ALPHA': MIXUP_ALPHA,
         'NUM_WORKERS': NUM_WORKERS,
@@ -792,17 +795,12 @@ class CheXpertDataset(Dataset):
         self.fallback_count = 0  # Track missing images for debugging
         self.return_masks = return_masks
         
-        # CRITICAL: Store ORIGINAL labels before replacing -1→0 (needed for mask creation)
-        self.original_labels = self.df[self.selected_labels].copy()
+        # PHASE 4 RULE: NaN → 0 (valid negative), -1 → label=0 but mask=0 (ignore)
+        raw = self.df[self.selected_labels].to_numpy(dtype=np.float32)
+        raw = np.nan_to_num(raw, nan=0.0)  # NaN → 0 (treat as negative)
         
-        # Handle uncertain labels (-1) and NaN
-        for label in self.selected_labels:
-            if label in self.df.columns:
-                self.df[label] = self.df[label].fillna(0)
-                self.df[label] = self.df[label].replace(-1, 0)
-        
-        # Precompute labels for stratified sampling
-        self.labels = self.df[self.selected_labels].fillna(0).replace(-1, 0).astype(np.float32).values
+        self.masks = (raw != -1.0).astype(np.float32)  # Only -1 masked out
+        self.labels = np.where(raw == -1.0, 0.0, raw).astype(np.float32)  # -1 → 0 for training
     
     def __len__(self):
         return len(self.df)
@@ -834,13 +832,7 @@ class CheXpertDataset(Dataset):
             labels = torch.from_numpy(self.labels[idx]).float()
             
             if self.return_masks:
-                # Create mask from ORIGINAL labels: 1 for certain, 0 for uncertain (-1 or NaN)
-                mask = torch.ones(len(self.selected_labels), dtype=torch.float32)
-                for i, label in enumerate(self.selected_labels):
-                    if label in self.original_labels.columns:
-                        orig_val = self.original_labels.iloc[idx][label]
-                        if pd.isna(orig_val) or orig_val == -1:
-                            mask[i] = 0.0  # Ignore uncertain labels
+                mask = torch.from_numpy(self.masks[idx]).float()
                 return image, labels, mask
             else:
                 return image, labels
@@ -855,7 +847,7 @@ class CheXpertDataset(Dataset):
                 image = self.transform(image)
             labels = torch.zeros(len(self.selected_labels), dtype=torch.float32)
             if self.return_masks:
-                mask = torch.ones(len(self.selected_labels), dtype=torch.float32)
+                mask = torch.zeros(len(self.selected_labels), dtype=torch.float32)  # IGNORE blank
                 return image, labels, mask
             return image, labels
 
@@ -934,7 +926,7 @@ class NIHDataset(Dataset):
                 image = self.transform(image)
             labels = torch.zeros(len(self.selected_labels), dtype=torch.float32)
             if self.return_masks:
-                mask = torch.ones(len(self.selected_labels), dtype=torch.float32)
+                mask = torch.zeros(len(self.selected_labels), dtype=torch.float32)  # IGNORE blank
                 return image, labels, mask
             return image, labels
 
@@ -995,7 +987,7 @@ class PneumoniaDataset(Dataset):
                 image = self.transform(image)
             labels = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)
             if self.return_masks:
-                mask = torch.ones(len(SELECTED_LABELS), dtype=torch.float32)
+                mask = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)  # IGNORE blank
                 return image, labels, mask
             return image, labels
 
@@ -1029,10 +1021,10 @@ class DenseNet121(nn.Module):
         num_ftrs = 1024
         # Enhanced classifier with dual dropout for better regularization
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5),  # First dropout layer
+            nn.Dropout(DROPOUT),  # Use config value (0.25 for Phase 4)
             nn.Linear(num_ftrs, 512),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),  # Second dropout layer
+            nn.Dropout(DROPOUT * 0.6),  # Proportional second dropout
             nn.Linear(512, num_classes)
         )
     
@@ -1179,7 +1171,9 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, epoc
     num_batches = len(loader)
     remainder = num_batches % ACCUMULATION_STEPS
     
-    pbar = tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}")
+    # Calculate end_epoch for display
+    end_epoch = epoch + FINETUNE_EPOCHS - 1  # Fallback if not in global scope
+    pbar = tqdm(loader, desc=f"Epoch {epoch}/{end_epoch}")
     
     for batch_idx, batch in enumerate(pbar):
         # Unpack with optional masks (3-tuple for Phase 4)
@@ -1277,37 +1271,25 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, epoc
 
 def validate(model, loader, dataset_name=""):
     """
-    Validate model on given dataset and compute per-class AUC scores.
-    
-    Args:
-        model: PyTorch model to evaluate
-        loader: DataLoader for validation data
-        dataset_name: Name of dataset for logging (e.g., "CheXpert", "NIH")
-        
-    Returns:
-        float or None: Mean AUC across valid classes, or None if no valid classes
-        
-    Features:
-        - Handles invalid labels (-1, NaN) by excluding from metrics
-        - Computes per-class AUC with detailed reporting
-        - Optional Test-Time Augmentation (TTA) for improved accuracy
-        - DirectML compatible (uses torch.no_grad instead of autocast)
-        - Progress bar with sample count display
+    Validate model on given dataset with MASK-AWARE AUC computation.
+    Only certain labels (mask=1) contribute to metrics.
     """
     was_training = model.training
     model.eval()
     all_preds = []
     all_labels = []
+    all_masks = []
     
     print(f"Validating on {dataset_name} ({len(loader.dataset)} samples)...")
     
-    with torch.inference_mode():  # Faster than no_grad, lower memory overhead
+    with torch.inference_mode():
         for batch in tqdm(loader, desc=f"Validating {dataset_name}"):
             # Handle 3-tuple or 2-tuple
             if len(batch) == 3:
-                images, labels, _ = batch  # Ignore masks during validation
+                images, labels, masks = batch
             else:
                 images, labels = batch
+                masks = torch.ones_like(labels)  # All certain for NIH/Pneumonia
             
             use_non_blocking = (str(DEVICE) == "cuda" and PIN_MEMORY)
             images = images.to(DEVICE, non_blocking=use_non_blocking)
@@ -1326,26 +1308,34 @@ def validate(model, loader, dataset_name=""):
             
             all_preds.append(probs)
             all_labels.append(labels.numpy())
+            all_masks.append(masks.numpy())
     
     all_preds = np.vstack(all_preds)
     all_labels = np.vstack(all_labels)
+    all_masks = np.vstack(all_masks)
     
-    # Compute AUC per disease
+    # Compute AUC per disease (only on certain labels)
     disease_aucs = []
-    per_class_aucs = {}  # Store for detailed monitoring
+    per_class_aucs = {}
     valid_diseases = 0
+    
     for i, label in enumerate(SELECTED_LABELS):
-        if len(np.unique(all_labels[:, i])) > 1:
-            auc = roc_auc_score(all_labels[:, i], all_preds[:, i])
+        # Only use samples where mask=1 (certain labels)
+        keep = all_masks[:, i] == 1
+        y_true = all_labels[keep, i]
+        y_pred = all_preds[keep, i]
+        
+        if len(y_true) > 0 and len(np.unique(y_true)) > 1:
+            auc = roc_auc_score(y_true, y_pred)
             disease_aucs.append(auc)
             per_class_aucs[label] = auc
             valid_diseases += 1
-            print(f"  {label:20s} {auc:.4f}")
+            print(f"  {label:20s} {auc:.4f} ({keep.sum()}/{len(keep)} certain)")
         else:
             per_class_aucs[label] = None
-            print(f"  {label:20s} N/A (single class)")
+            print(f"  {label:20s} N/A (single class or no certain labels)")
     
-    mean_auc = np.mean(disease_aucs) if disease_aucs else 0.0
+    mean_auc = float(np.mean(disease_aucs)) if disease_aucs else 0.0
     print(f"  {'Mean AUC':20s} {mean_auc:.4f} (across {valid_diseases} classes)\n")
     
     # Restore original training state instead of forcing train mode
@@ -1606,18 +1596,9 @@ def main():
             eta_min=1e-7   # Minimum learning rate
         )
         
-        # Resume optimizer and scheduler state if available
-        if resume_info['optimizer_state'] is not None:
-            optimizer.load_state_dict(resume_info['optimizer_state'])
-            # Move optimizer state tensors to DEVICE (fixes device mismatch bug)
-            for state in optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(DEVICE)
-            print("Resumed optimizer state")
-        if resume_info['scheduler_state'] is not None:
-            scheduler.load_state_dict(resume_info['scheduler_state'])
-            print("Resumed scheduler state")
+        # PHASE 4: DO NOT resume optimizer/scheduler (fine-tune needs fresh LR + fresh moments)
+        print("PHASE 4: Starting with FRESH optimizer/scheduler (not resuming state)")
+        print(f"  Learning Rate: {LEARNING_RATE:.2e}")
         
         scaler = GradScaler(enabled=AMP_ENABLED) if HAS_AMP else None
         
@@ -1638,7 +1619,7 @@ def main():
                 "batch_size": BATCH_SIZE,
                 "accumulation_steps": ACCUMULATION_STEPS,
                 "learning_rate": LEARNING_RATE,
-                "epochs": EPOCHS,
+                "finetune_epochs": FINETUNE_EPOCHS,
                 "img_size": IMG_SIZE,
                 "device": str(DEVICE),  # CRITICAL: JSON-safe serialization
                 "amp_enabled": AMP_ENABLED,
@@ -1676,10 +1657,15 @@ def main():
         
         best_auc = resume_info['best_auc']
         start_epoch = resume_info['start_epoch']
+        end_epoch = start_epoch + FINETUNE_EPOCHS - 1
         patience_counter = 0
         start_time = time.time()
         
-        for epoch in range(start_epoch, EPOCHS + 1):
+        print(f"\n{'='*70}")
+        print(f"Fine-tuning Plan: Epoch {start_epoch} → {end_epoch} (total {FINETUNE_EPOCHS} epochs)")
+        print(f"{'='*70}\n")
+        
+        for epoch in range(start_epoch, end_epoch + 1):
             epoch_start = time.time()
             
             # Train
@@ -1826,7 +1812,7 @@ def main():
                         'pneumonia_consolidation_auc': pneu_cons_auc
                     }
                     
-                    torch.save(checkpoint, os.path.join(CHECKPOINT_DIR, 'best_model_phase3_fulldata.pt'))
+                    torch.save(checkpoint, BEST_MODEL_OUT)
                     print(f"\n🎉 NEW BEST MODEL SAVED! Min AUC: {min_auc:.4f}")
                     print(f"   Core (NIH+CheXpert 5 diseases): {min_auc_core:.4f}")
                     print(f"   Pneumonia (Consolidation):      {pneu_cons_auc:.4f}")
