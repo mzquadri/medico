@@ -6,7 +6,8 @@ Fine-tune Phase 3 checkpoint with uncertainty masking:
 1. MaskedSmoothedFocalLoss: Ignore uncertain (-1) labels in CheXpert
 2. Mask-aware mixup: Handle mixed masks correctly
 3. CheXpert NaN→0, -1→masked (not false negative)
-4. NIH & Pneumonia: Always return masks (all 1s)
+4. NIH: All masks = 1 (all certain)
+   Pneumonia: Only Pneumonia mask = 1, rest = 0 (UNKNOWN, not false negatives)
 5. Fine-tune from Epoch 16 checkpoint
 6. Low LR (5e-6), low dropout (0.25), no mixup
 7. CPU-friendly: No gradient checkpointing
@@ -373,16 +374,29 @@ def quick_image_path_sanity(dataset, name, n=2000):
         for i in sample_indices:
             row = dataset.df.iloc[i]
             
-            # CheXpert path handling - match CheXpertDataset logic (try both strategies)
+            # CheXpert path handling - match CheXpertDataset logic (robust 3-strategy approach)
             if hasattr(dataset, 'root_dir'):
                 rel_path = row['Path']
                 rel_path_normalized = rel_path.replace('/', os.sep)
-                img_path = os.path.join(dataset.root_dir, rel_path_normalized)
                 
-                # If not found and has prefix, try stripping it
-                if not os.path.exists(img_path) and rel_path.startswith('CheXpert-v1.0-small/'):
-                    rel_path_stripped = rel_path.replace('CheXpert-v1.0-small/', '', 1).replace('/', os.sep)
-                    img_path = os.path.join(dataset.root_dir, rel_path_stripped)
+                candidates = []
+                candidates.append(os.path.join(dataset.root_dir, rel_path_normalized))
+                
+                prefix = 'CheXpert-v1.0-small' + os.sep
+                if rel_path_normalized.startswith(prefix):
+                    stripped = rel_path_normalized[len(prefix):]
+                    candidates.append(os.path.join(dataset.root_dir, stripped))
+                
+                if os.path.basename(os.path.normpath(dataset.root_dir)) == 'CheXpert-v1.0-small':
+                    if rel_path_normalized.startswith(prefix):
+                        stripped = rel_path_normalized[len(prefix):]
+                        candidates.append(os.path.join(dataset.root_dir, stripped))
+                
+                img_path = next((p for p in candidates if os.path.exists(p)), None)
+                
+                if img_path is None:
+                    missing += 1
+                    continue
             # NIH path handling
             elif hasattr(dataset, 'image_dir'):
                 img_path = os.path.join(dataset.image_dir, row['Image Index'])
@@ -935,20 +949,34 @@ class CheXpertDataset(Dataset):
     def __getitem__(self, idx):
         try:
             row = self.df.iloc[idx]
-            # Robust path resolution: try with and without prefix stripping
+            
+            # ✅ ROBUST PATH RESOLUTION: Try multiple strategies to find image
             rel_path = row['Path']
             rel_path_normalized = rel_path.replace('/', os.sep)
             
-            # Try with original path first
-            img_path = os.path.join(self.root_dir, rel_path_normalized)
+            candidates = []
             
-            # If not found and has prefix, try stripping it
-            if not os.path.exists(img_path) and rel_path.startswith('CheXpert-v1.0-small/'):
-                rel_path_stripped = rel_path.replace('CheXpert-v1.0-small/', '', 1).replace('/', os.sep)
-                img_path = os.path.join(self.root_dir, rel_path_stripped)
+            # Strategy 1: root_dir + full CSV path (most common)
+            candidates.append(os.path.join(self.root_dir, rel_path_normalized))
             
-            if not os.path.exists(img_path):
-                raise FileNotFoundError(f"Image not found: {img_path}")
+            # Strategy 2: root_dir + stripped prefix (if CSV has prefix)
+            prefix = 'CheXpert-v1.0-small' + os.sep
+            if rel_path_normalized.startswith(prefix):
+                stripped = rel_path_normalized[len(prefix):]
+                candidates.append(os.path.join(self.root_dir, stripped))
+            
+            # Strategy 3: If root_dir already ends with CheXpert-v1.0-small,
+            # try using path without prefix (handles duplicate prefix case)
+            if os.path.basename(os.path.normpath(self.root_dir)) == 'CheXpert-v1.0-small':
+                if rel_path_normalized.startswith(prefix):
+                    stripped = rel_path_normalized[len(prefix):]
+                    candidates.append(os.path.join(self.root_dir, stripped))
+            
+            # Find first existing path
+            img_path = next((p for p in candidates if os.path.exists(p)), None)
+            
+            if img_path is None:
+                raise FileNotFoundError(f"Image not found. Tried: {candidates}")
             
             image = Image.open(img_path).convert('L')
             
@@ -1641,11 +1669,15 @@ def main():
         # Load datasets with optimized data loading
         print("\nLoading datasets...")
         
-        # Disable CLAHE for Intel Arc training (3-4x speedup, CPU bottleneck with NUM_WORKERS=0)
-        enable_train_clahe = False  # Always disabled for Intel Arc (DirectML/XPU)
-        if not enable_train_clahe:
-            print(" CLAHE disabled for training (Intel Arc optimization)")
-            print("   Validation still uses CLAHE for accurate metrics\n")
+        # CLAHE only disabled on Arc/DirectML/CPU (CPU bottleneck with NUM_WORKERS=0)
+        # CUDA has enough workers + CPU bandwidth, so CLAHE is beneficial
+        enable_train_clahe = (str(DEVICE) == "cuda") and (not IS_DIRECTML)
+        
+        if enable_train_clahe:
+            print("✅ CLAHE enabled for training (CUDA device - sufficient CPU bandwidth)")
+        else:
+            print("⚠️  CLAHE disabled for training (Arc/DirectML/CPU - CPU bottleneck)")
+        print("   Validation always uses CLAHE for accurate metrics\n")
         
         train_transform = get_transforms(train=True, enable_clahe=enable_train_clahe)
         val_transform = get_transforms(train=False, enable_clahe=True)
@@ -2259,7 +2291,8 @@ def main():
                     print(f"\nWARNING: NIH validation has N/A AUC for: {missing_nih}")
                     print("         These diseases may have single-class labels in validation split")
                 
-                # Core metric: NIH min AUC across all 14 diseases (excluding rare diseases like Hernia)
+                # Core metric: NIH-only min AUC across 14 diseases (NIH is the ONLY dataset labeling all 14)
+                # CheXpert only labels 7 diseases, so using it would allow "skipping" unlabeled diseases
                 min_auc_core = compute_min_auc_filtered(
                     [nih_per_class],  # NIH ONLY - the only dataset with all 14 labels
                     exclude_diseases=RARE_DISEASES
@@ -2278,7 +2311,7 @@ def main():
                 print(f"{'='*70}")
                 print(f"NIH Effusion AUC:              {nih_eff_auc:.4f}  <- Historically challenging")
                 print(f"Pneumonia Binary AUC:          {pneu_pneu_auc:.4f}  <- Binary classification")
-                print(f"Min AUC (Core 14 diseases):    {min_auc_core:.4f}  <- NIH+CheXpert all 14")
+                print(f"Min AUC (Core 14 diseases):    {min_auc_core:.4f}  <- NIH-only (true 14-label coverage)")
                 print(f"Min AUC (Global):              {min_auc:.4f}  <- CHECKPOINT CRITERION")
                 
                 if epoch >= 10 and nih_eff_auc < 0.60:
