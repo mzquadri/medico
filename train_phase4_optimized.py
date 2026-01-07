@@ -185,9 +185,10 @@ USE_FULL_PNEUMONIA = True    # Use all 5.2K images
 # Phase-4 spec: CPU-friendly = False, but Arc 2GB VRAM needs it
 USE_GRADIENT_CHECKPOINTING = (IS_DIRECTML or str(DEVICE) == "xpu")  # Conditional: True for Arc/DirectML, False for CPU
 
-# Focal Loss
-FOCAL_ALPHA = 0.25
+# Focal Loss - PHASE 4 OPTIMIZED
+FOCAL_ALPHA = 0.75      #  Positives get higher focus (was 0.25) - 3:1 ratio
 FOCAL_GAMMA = 2.0
+FOCAL_SMOOTHING = 0.02  #  Better for medical/noisy labels (was hardcoded 0.05)
 
 # Paths
 CHEXPERT_ROOT = r"C:\Users\MohdZaminQuadri\Downloads\Medico-Xray\datasets\chexpert"
@@ -547,62 +548,82 @@ def cleanup_temp_files():
 # ============================================================================
 class MaskedSmoothedFocalLoss(nn.Module):
     """
-    Smoothed focal loss with optional masks (ignore uncertain labels).
-    Automatically handles class imbalance via per-class weights.
+    Mask-aware focal loss with label smoothing + positive-only class weighting.
     
-    CRITICAL FIX: Uses alpha_t per element (α for positives, 1-α for negatives).
-    This gives positives 3x relative focus (0.25 vs 0.75) which is essential for
-    imbalanced classes like Cardiomegaly.
+    CRITICAL IMPROVEMENTS:
+    - CheXpert uncertain (-1) masked (mask=0) contributes 0 loss
+    - Alpha applied using HARD targets (not smoothed) for correct pos/neg weighting
+    - Class weights applied ONLY to positives (rare positive emphasis)
+    - Normalization uses (mask * weight_matrix) for stable scaling
     
     Args:
-        alpha: Weight for positive samples (default: 0.25)
-        gamma: Focusing parameter (default: 2.0)
-        smoothing: Label smoothing factor (default: 0.05)
-        class_weights: (C,) tensor with per-class weights (higher for rare diseases)
+        alpha: Weight for positive samples (0.75 = 3:1 pos:neg focus)
+        gamma: Focusing parameter (2.0 standard)
+        smoothing: Label smoothing (0.02 for medical/noisy labels)
+        class_weights: (C,) tensor for per-class weighting (positive-only boost)
     """
-    def __init__(self, alpha=0.25, gamma=2.0, smoothing=0.05, class_weights=None):
+    def __init__(self, alpha=0.75, gamma=2.0, smoothing=0.02, class_weights=None):
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.smoothing = smoothing
-        self.class_weights = class_weights
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.smoothing = float(smoothing)
+        self.class_weights = class_weights  # (C,) tensor or None
 
-    def forward(self, inputs, targets, masks=None):
-        # Label smoothing
-        targets_smoothed = targets * (1 - self.smoothing) + 0.5 * self.smoothing
+    def forward(self, logits, targets, masks=None):
+        """
+        Args:
+            logits: (N, C) raw model outputs
+            targets: (N, C) binary labels {0, 1}
+            masks: (N, C) binary masks {0=ignore, 1=certain}
+        
+        Returns:
+            Scalar loss value
+        """
+        # Ensure float tensors
+        targets = targets.float()
 
-        # Binary cross entropy
-        bce = F.binary_cross_entropy_with_logits(inputs, targets_smoothed, reduction='none')
-        pt = torch.exp(-bce)
+        # Default: all certain
+        if masks is None:
+            masks = torch.ones_like(targets)
+        else:
+            masks = masks.float()
 
-        # CRITICAL FIX: alpha_t per element (α for pos, 1-α for neg)
-        # targets_smoothed is close to 0 or 1, so this balances pos/neg focus
-        alpha_t = self.alpha * targets_smoothed + (1.0 - self.alpha) * (1.0 - targets_smoothed)
+        # HARD targets for alpha + positive-only weights
+        # (prevents smoothing from interfering with alpha calculation)
+        t_hard = (targets >= 0.5).float()
 
-        # Focal term with per-element alpha
-        focal = alpha_t * (1 - pt) ** self.gamma * bce  # (N, C)
+        # Label smoothing only affects BCE target
+        t_smooth = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
 
-        # Apply per-class weights (broadcast over batch dimension)
+        # Binary cross entropy per element
+        bce = F.binary_cross_entropy_with_logits(logits, t_smooth, reduction="none")
+
+        # Probabilities for focal term (use hard targets for p_t stability)
+        p = torch.sigmoid(logits)
+        p_t = p * t_hard + (1.0 - p) * (1.0 - t_hard)  # (N, C)
+
+        # Alpha per element (hard targets)
+        alpha_t = self.alpha * t_hard + (1.0 - self.alpha) * (1.0 - t_hard)
+
+        # Focal core term
+        focal = alpha_t * ((1.0 - p_t).clamp_min(1e-6) ** self.gamma) * bce  # (N, C)
+
+        # ✅ CRITICAL: Positive-only class weights
+        # Only positives get boosted (prevents negative flooding)
         if self.class_weights is not None:
             cw = self.class_weights.to(focal.device).view(1, -1)  # (1, C)
-            focal = focal * cw
+            weight_mat = 1.0 + (cw - 1.0) * t_hard  # Only positives boosted
         else:
-            cw = None
+            weight_mat = 1.0
 
-        # Apply masks (ignore uncertain labels)
-        if masks is not None:
-            focal = focal * masks
-            
-            # Better normalization when class weights are used
-            # Divide by sum of (mask * class_weight) to account for both
-            if cw is not None:
-                denom = (masks * cw).sum().clamp_min(1e-6)
-            else:
-                denom = masks.sum().clamp_min(1e-6)
-            
-            return focal.sum() / denom
+        focal = focal * weight_mat
 
-        return focal.mean()
+        # Mask uncertain/unknown labels
+        focal = focal * masks
+
+        # ✅ Proper normalization (mask + weight aware)
+        denom = (masks * weight_mat).sum().clamp_min(1e-6)
+        return focal.sum() / denom
 
 class SmoothedFocalLoss(nn.Module):
     """Legacy: Focal Loss with multi-label smoothing (kept for compatibility)"""
@@ -1075,8 +1096,10 @@ class PneumoniaDataset(Dataset):
                 raise ValueError("Pneumonia not in SELECTED_LABELS! Check configuration.")
             
             if self.return_masks:
-                # Pneumonia has no uncertain labels - all certain
-                mask = torch.ones(len(SELECTED_LABELS), dtype=torch.float32)
+                # ✅ CRITICAL FIX: Only Pneumonia disease is labeled
+                # Other diseases are UNKNOWN (not certain negatives)
+                mask = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)
+                mask[pneumonia_idx] = 1.0  # Only Pneumonia is certain
                 return image, labels, mask
             else:
                 return image, labels
@@ -1091,7 +1114,8 @@ class PneumoniaDataset(Dataset):
                 image = self.transform(image)
             labels = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)
             if self.return_masks:
-                mask = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)  # IGNORE blank
+                # Blank images: all masked (ignore completely)
+                mask = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)
                 return image, labels, mask
             return image, labels
 
@@ -1541,17 +1565,20 @@ RARE_DISEASES = ['Hernia']  # Hernia only has 227 samples (0.08% of dataset)
 
 def compute_class_weights_mask_aware(nih_ds, chex_ds, pneu_ds, cap=10.0):
     """
-    Compute class weights using only CERTAIN labels (respects masks).
+    Compute class weights using only CERTAIN labels (mask-aware).
     
-    CRITICAL: Prevents CheXpert "unknown" diseases from inflating weights.
+    CRITICAL FIX: Pneumonia dataset only labels Pneumonia disease.
+    Other diseases are UNKNOWN (mask=0), so they don't contribute to weights.
     
-    For diseases NOT in CheXpert (Emphysema, Fibrosis, etc.), the denominator
-    should be NIH + Pneumonia samples ONLY, not the full 272K dataset size.
+    Dataset contributions:
+    - NIH: All 14 classes certain
+    - CheXpert: Only 7 classes certain; uncertain (-1) masked; missing diseases masked
+    - Pneumonia: ONLY Pneumonia class certain; other 13 classes mask=0 (ignored)
     
     Args:
         nih_ds: NIH dataset (all labels certain)
         chex_ds: CheXpert dataset (has masks for uncertain labels)
-        pneu_ds: Pneumonia dataset (all labels certain)
+        pneu_ds: Pneumonia dataset (only Pneumonia labeled)
         cap: Maximum weight value (prevents extreme values)
     
     Returns:
@@ -1561,17 +1588,20 @@ def compute_class_weights_mask_aware(nih_ds, chex_ds, pneu_ds, cap=10.0):
     pos = np.zeros(C, dtype=np.float64)
     certain = np.zeros(C, dtype=np.float64)
 
-    # NIH: all certain (mask=1 for all)
+    # NIH: all certain (mask=1 for all diseases)
     pos += nih_ds.labels.sum(axis=0)
     certain += len(nih_ds)  # Each sample contributes 1 to all classes
 
-    # CheXpert: use masks (unknown diseases have mask=0)
+    # CheXpert: mask-aware (only certain labels counted)
     pos += chex_ds.labels.sum(axis=0)
-    certain += chex_ds.masks.sum(axis=0)  # Only count certain labels!
+    certain += chex_ds.masks.sum(axis=0)  # ✅ Only count certain labels
 
-    # Pneumonia: all certain (only Pneumonia disease labeled, rest are certain negatives)
-    pos[LABEL_TO_IDX['Pneumonia']] += float(sum(pneu_ds.labels_list))
-    certain += len(pneu_ds)  # Each sample contributes 1 to all classes
+    # ✅ CRITICAL FIX: Pneumonia dataset only labels Pneumonia disease
+    # Other diseases are UNKNOWN (not certain negatives)
+    pneu_idx = LABEL_TO_IDX["Pneumonia"]
+    pneu_pos = float(np.sum(getattr(pneu_ds, "labels_list", [])))
+    pos[pneu_idx] += pneu_pos
+    certain[pneu_idx] += len(pneu_ds)  # ✅ Only Pneumonia gets certainty boost
 
     weights = []
     print(f"\n{'='*70}")
@@ -1852,7 +1882,10 @@ def main():
                         labels[pneumonia_idx] = self.labels_list[idx]
                     
                     if self.return_masks:
-                        mask = torch.ones(len(SELECTED_LABELS), dtype=torch.float32)
+                        # ✅ CRITICAL FIX: Only Pneumonia disease is labeled
+                        mask = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)
+                        if pneumonia_idx >= 0:
+                            mask[pneumonia_idx] = 1.0  # Only Pneumonia is certain
                         return image, labels, mask
                     return image, labels
                 except Exception as e:
@@ -1864,6 +1897,7 @@ def main():
                         image = self.transform(image)
                     labels = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)
                     if self.return_masks:
+                        # Blank images: all masked (ignore completely)
                         mask = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)
                         return image, labels, mask
                     return image, labels
@@ -2021,7 +2055,7 @@ def main():
         criterion = MaskedSmoothedFocalLoss(
             alpha=FOCAL_ALPHA, 
             gamma=FOCAL_GAMMA, 
-            smoothing=0.05,
+            smoothing=FOCAL_SMOOTHING,  # ✅ Use config value (0.02)
             class_weights=class_weights_tensor  # Apply class weights
         )
         optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
