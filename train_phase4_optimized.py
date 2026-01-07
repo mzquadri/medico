@@ -336,10 +336,17 @@ def print_dataset_stats(dataset_name, dataset, selected_labels):
     # Try precomputed labels first (NIH, CheXpert)
     if hasattr(dataset, 'labels'):
         labels_matrix = dataset.labels
+        # ✅ MASK-AWARE: Only count positives where mask=1 (correct for CheXpert)
+        if hasattr(dataset, 'masks'):
+            masks_matrix = dataset.masks
+        else:
+            masks_matrix = np.ones_like(labels_matrix)  # NIH: all certain
+        
         for i, label in enumerate(selected_labels):
-            positive = int(labels_matrix[:, i].sum())
+            positive = int(((labels_matrix[:, i] == 1) & (masks_matrix[:, i] == 1)).sum())
+            certain = int((masks_matrix[:, i] == 1).sum())
             total = len(dataset)
-            print(f"  {label:20s}: {positive:6d}/{total} ({positive/total*100:.1f}%)")
+            print(f"  {label:20s}: +{positive:6d} / certain {certain:6d} / total {total:6d}")
     # Fallback to df columns (old CheXpert path)
     elif hasattr(dataset, 'df'):
         df = dataset.df
@@ -661,6 +668,10 @@ class MaskedSmoothedFocalLoss(nn.Module):
         """
         # Ensure float tensors
         targets = targets.float()
+        
+        # ✅ SAFETY: Clamp targets to valid BCE range (protects against any dataset bug)
+        # Prevents inf/nan from negative or >1 values (e.g., if -1 leaks through)
+        targets = targets.clamp(0.0, 1.0)
 
         # Default: all certain
         if masks is None:
@@ -1009,8 +1020,10 @@ class CheXpertDataset(Dataset):
                 mask = (col_data != -1.0)  # NaN != -1.0 is True, so NaNs keep mask=1
                 self.masks[:, nih_idx] = mask.astype(np.float32)
                 
-                # Labels: NaN → 0, -1 → 0 (but -1 masked so value irrelevant)
+                # ✅ CRITICAL: Convert NaN→0, then ALSO force -1→0 (prevents BCE inf/nan + protects class weights)
+                # Even though -1 is masked, leaving it in labels array corrupts .sum() operations
                 col_clean = np.nan_to_num(col_data, nan=0.0)
+                col_clean[col_data == -1.0] = 0.0  # Force -1 to 0 (still masked, but keeps array valid)
                 self.labels[:, nih_idx] = col_clean.astype(np.float32)
         
         # CRITICAL FIX: CheXpert does NOT provide labels for remaining NIH diseases.
@@ -1022,6 +1035,15 @@ class CheXpertDataset(Dataset):
                 j = LABEL_TO_IDX[disease]
                 self.masks[:, j] = 0.0  # ignore loss/metrics for this disease on CheXpert
                 self.labels[:, j] = 0.0  # value irrelevant because mask=0
+        
+        # ✅ POST-CHECK: Ensure masked entries have label=0 (catches regressions)
+        # Prevents class weight corruption and BCE inf/nan issues
+        bad = (self.masks == 0) & (self.labels != 0)
+        if bad.any():
+            bad_count = bad.sum()
+            print(f"ERROR: CheXpert has {bad_count} masked entries with non-zero labels!")
+            print("This breaks class weights (inflates negatives) and can cause BCE inf/nan.")
+            raise RuntimeError("CheXpert: masked entries must have label=0 to avoid BCE/weights issues.")
     
     def __len__(self):
         return len(self.df)
@@ -1706,9 +1728,10 @@ def compute_class_weights_mask_aware(nih_ds, chex_ds, pneu_ds, cap=10.0):
     pos += nih_ds.labels.sum(axis=0)
     certain += len(nih_ds)  # Each sample contributes 1 to all classes
 
+    # ✅ CRITICAL: Count positives ONLY where mask=1 (truly mask-aware)
     # CheXpert: mask-aware (only certain labels counted)
-    pos += chex_ds.labels.sum(axis=0)
-    certain += chex_ds.masks.sum(axis=0)  # ✅ Only count certain labels
+    pos += (chex_ds.labels * chex_ds.masks).sum(axis=0)  # Only count certain positives
+    certain += chex_ds.masks.sum(axis=0)  # Only count certain labels
 
     # ✅ CRITICAL FIX: Pneumonia dataset only labels Pneumonia disease
     # Other diseases are UNKNOWN (not certain negatives)
