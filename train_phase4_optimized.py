@@ -148,10 +148,10 @@ SELECTED_LABELS = [
 ]
 LABEL_TO_IDX = {label: idx for idx, label in enumerate(SELECTED_LABELS)}  # Safe label indexing
 
-# FINE-TUNING HYPERPARAMETERS (optimized for Phase 4)
-IMG_SIZE = 320
-BATCH_SIZE = 8             # Keep same for consistency
-ACCUMULATION_STEPS = 16      # Effective batch = 128
+# FINE-TUNING HYPERPARAMETERS (optimized for Phase 4 + Intel Arc 2GB VRAM)
+IMG_SIZE = 224               # Reduced from 320 for 2GB VRAM (saves 51% memory)
+BATCH_SIZE = 4               # Reduced from 8 for 2GB VRAM (saves 50% memory)
+ACCUMULATION_STEPS = 32      # Increased from 16 to maintain effective batch = 128
 LEARNING_RATE = 5e-6         # REDUCED for fine-tuning (was 3e-5)
 FINETUNE_EPOCHS = 15         # How many NEW epochs to run after resume
 EARLY_STOPPING_PATIENCE = 10 # Reduced patience
@@ -182,7 +182,7 @@ NIH_SAMPLE_SIZE = None       # Use all 112K images
 USE_FULL_PNEUMONIA = True    # Use all 5.2K images
 
 # Gradient Checkpointing (Memory Efficiency)
-USE_GRADIENT_CHECKPOINTING = False  # Disabled for Phase 4 (CPU-friendly fine-tuning)
+USE_GRADIENT_CHECKPOINTING = True  # ENABLED for Intel Arc 2GB VRAM (critical for memory)
 
 # Focal Loss
 FOCAL_ALPHA = 0.25
@@ -515,7 +515,10 @@ def cleanup_temp_files():
     """Clean up temporary files and old checkpoints"""
     print("\nCleaning up temporary files...")
     
-    temp_files = ['temp_nih_train.csv', 'temp_nih_val.csv']
+    temp_files = [
+        'temp_nih_train.csv', 'temp_nih_val.csv', 'temp_nih_test.csv',
+        'temp_chexpert_train.csv', 'temp_chexpert_val.csv', 'temp_chexpert_test.csv'
+    ]
     for temp_file in temp_files:
         if os.path.exists(temp_file):
             try:
@@ -860,10 +863,15 @@ class CheXpertDataset(Dataset):
                 self.masks[:, nih_idx] = (col_data != -1.0).astype(np.float32)  # -1 → masked
                 self.labels[:, nih_idx] = np.where(col_data == -1.0, 0.0, col_data)
         
-        # For NIH diseases NOT in CheXpert (Emphysema, Fibrosis, etc.):
-        # - Labels remain 0 (no positive examples)
-        # - Masks remain 1 (treat as certain negatives)
-        # This is correct: CheXpert simply doesn't have these diseases labeled
+        # CRITICAL FIX: CheXpert does NOT provide labels for remaining NIH diseases.
+        # Treat them as "unknown", NOT as certain negatives (prevents false negative noise).
+        chexpert_labeled_nih = set(chexpert_to_nih.values())  # diseases we actually filled from CSV
+        
+        for disease in self.selected_labels:
+            if disease not in chexpert_labeled_nih:
+                j = LABEL_TO_IDX[disease]
+                self.masks[:, j] = 0.0  # ignore loss/metrics for this disease on CheXpert
+                self.labels[:, j] = 0.0  # value irrelevant because mask=0
     
     def __len__(self):
         return len(self.df)
@@ -937,16 +945,10 @@ class NIHDataset(Dataset):
             # Exact match in pipe-separated list
             return self.df['Finding Labels'].str.contains(rf'(^|\|){lbl}(\||$)', regex=True)
         
-        # Map all 14 NIH diseases with correct CSV names
-        # CRITICAL: NIH CSV uses "Pleural Thickening" (space), not "Pleural_Thickening" (underscore)
-        NIH_NAME_MAP = {
-            "Pleural_Thickening": "Pleural Thickening"  # Map internal name to CSV name
-        }
-        
-        # Map all diseases dynamically
+        # Map all 14 NIH diseases directly (NIH CSV uses underscore: "Pleural_Thickening")
+        # No name mapping needed - internal names match CSV exactly
         for disease in self.selected_labels:
-            csv_name = NIH_NAME_MAP.get(disease, disease)  # Use mapped name or original
-            self.labels[:, LABEL_TO_IDX[disease]] = has(csv_name).astype(np.float32).values
+            self.labels[:, LABEL_TO_IDX[disease]] = has(disease).astype(np.float32).values
     
     def __len__(self):
         return len(self.df)
@@ -1150,18 +1152,27 @@ def create_model(num_classes=5):
     resume_info = {'start_epoch': 1, 'best_auc': 0.0, 'optimizer_state': None, 'scheduler_state': None}
     
     if RESUME_FROM_BEST:
-        if not os.path.exists(BEST_CHECKPOINT):
-            print(f"ERROR: Checkpoint not found at {BEST_CHECKPOINT}")
+        # Prioritize epoch 16 checkpoint (as per phase description), else use best
+        EPOCH16_CHECKPOINT = os.path.join(os.path.dirname(BEST_CHECKPOINT), "checkpoint_epoch_16.pt")
+        
+        if os.path.exists(EPOCH16_CHECKPOINT):
+            checkpoint_path = EPOCH16_CHECKPOINT
+            print(f"Loading Epoch 16 checkpoint (phase description): {checkpoint_path}")
+        elif os.path.exists(BEST_CHECKPOINT):
+            checkpoint_path = BEST_CHECKPOINT
+            print(f"Loading best checkpoint (epoch 16 not found): {checkpoint_path}")
+        else:
+            print(f"ERROR: No checkpoint found at {BEST_CHECKPOINT} or {EPOCH16_CHECKPOINT}")
             print(f"Set RESUME_FROM_BEST=False to train from scratch, or provide valid checkpoint.")
             sys.exit(1)
         
-        print(f"Loading best checkpoint from: {BEST_CHECKPOINT}")
+        print(f"Loading checkpoint from: {checkpoint_path}")
         # Version-safe checkpoint load (PyTorch 1.13+ uses weights_only, older versions don't)
         try:
-            checkpoint = torch.load(BEST_CHECKPOINT, map_location="cpu", weights_only=False)
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         except TypeError:
             # Fallback for PyTorch < 1.13
-            checkpoint = torch.load(BEST_CHECKPOINT, map_location="cpu")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
         
         state = checkpoint['model_state_dict']
         
@@ -1396,8 +1407,8 @@ def validate(model, loader, dataset_name=""):
             probs = torch.sigmoid(outputs).cpu().numpy()
             
             all_preds.append(probs)
-            all_labels.append(labels.numpy())
-            all_masks.append(masks.numpy())
+            all_labels.append(labels.cpu().numpy())  # .cpu() for DirectML/pinned memory safety
+            all_masks.append(masks.cpu().numpy())    # .cpu() for DirectML/pinned memory safety
     
     all_preds = np.vstack(all_preds)
     all_labels = np.vstack(all_labels)
@@ -1478,10 +1489,10 @@ def main():
         # Load datasets with optimized data loading
         print("\nLoading datasets...")
         
-        # Disable CLAHE for DirectML training (3-4x speedup, bottleneck with NUM_WORKERS=0)
-        enable_train_clahe = not IS_DIRECTML
+        # Disable CLAHE for Intel Arc training (3-4x speedup, CPU bottleneck with NUM_WORKERS=0)
+        enable_train_clahe = False  # Always disabled for Intel Arc (DirectML/XPU)
         if not enable_train_clahe:
-            print(" CLAHE disabled for training (DirectML optimization)")
+            print(" CLAHE disabled for training (Intel Arc optimization)")
             print("   Validation still uses CLAHE for accurate metrics\n")
         
         train_transform = get_transforms(train=True, enable_clahe=enable_train_clahe)
@@ -1776,8 +1787,8 @@ def main():
         # This makes training progress predictable and validation cadence reasonable
         # CPU is much slower, so use fewer steps per epoch for practical training time
         # DirectML/GPU: 600-1500 steps, CPU: 200 steps for ~2 hour epochs
-        if IS_DIRECTML:
-            TARGET_OPT_STEPS_PER_EPOCH = 600
+        if IS_DIRECTML or str(DEVICE) == "xpu":  # Intel Arc (DirectML or native XPU)
+            TARGET_OPT_STEPS_PER_EPOCH = 400  # Reduced for Intel Arc performance (~2-3 hours/epoch)
         elif str(DEVICE) == "cuda":
             TARGET_OPT_STEPS_PER_EPOCH = 1500
         else:  # CPU
@@ -1840,16 +1851,28 @@ def main():
             persistent_workers=PERSISTENT_WORKERS
         )
         
-        # Use stratified validation loaders for consistent metrics (3K images per dataset)
-        print("Creating stratified validation loaders (3K images each for stable metrics)...")
+        # Use validation loaders: FULL NIH (avoid dropping rare positives), sampled CheXpert/Pneumonia
+        print("Creating validation loaders...")
+        # Reduced validation samples for Intel Arc (faster validation)
+        val_sample_size = 1000 if (IS_DIRECTML or str(DEVICE) == "xpu") else 3000
+        
+        # CheXpert: stratified sampling (large dataset)
         chexpert_val_loader = create_stratified_sampled_loader(
-            chexpert_valid, sample_size=3000, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS
+            chexpert_valid, sample_size=val_sample_size, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS
         )
-        nih_val_loader = create_stratified_sampled_loader(
-            nih_valid, sample_size=3000, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS
+        
+        # NIH: FULL validation (no sampling) to ensure rare diseases have enough positives
+        # (Hernia only has 15 val samples, sampling could drop all positives!)
+        nih_val_loader = create_dataloader(
+            nih_valid, batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+            prefetch_factor=PREFETCH_FACTOR, persistent_workers=PERSISTENT_WORKERS
         )
+        print(f"  NIH validation: FULL set ({len(nih_valid):,} images - no sampling for rare diseases)")
+        
+        # Pneumonia: stratified sampling
         pneumonia_val_loader = create_stratified_sampled_loader(
-            pneumonia_valid, sample_size=min(3000, len(pneumonia_valid)), batch_size=BATCH_SIZE, num_workers=NUM_WORKERS
+            pneumonia_valid, sample_size=min(val_sample_size, len(pneumonia_valid)), batch_size=BATCH_SIZE, num_workers=NUM_WORKERS
         )
         
         # Create model
@@ -2094,7 +2117,7 @@ def main():
                     
                     torch.save(checkpoint, BEST_MODEL_OUT)
                     print(f"\n🎉 NEW BEST MODEL SAVED! Min AUC: {min_auc:.4f}")
-                    print(f"   Core (NIH+CheXpert 5 diseases): {min_auc_core:.4f}")
+                    print(f"   Core (NIH+CheXpert 14 diseases): {min_auc_core:.4f}")
                     print(f"   Pneumonia (Pneumonia):          {pneu_pneu_auc:.4f}")
                     
                     # Clean up ALL emergency checkpoints after successful best model save
