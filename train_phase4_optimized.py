@@ -175,7 +175,6 @@ PIN_MEMORY = (str(DEVICE) == "cuda")  # Only enable on CUDA, not DirectML or CPU
 # TRAINING EFFICIENCY
 VALIDATE_EVERY_N_EPOCHS = 2  # Validate less frequently
 GRADIENT_CLIP_NORM = 1.0     # Gradient clipping
-USE_TTA = False              # Test-Time Augmentation (horizontal flip, ~2x val time, +AUC)
 
 # FULL DATASET TRAINING (NO SAMPLING)
 CHEXPERT_SAMPLE_SIZE = None  # Use all 223K images
@@ -314,7 +313,7 @@ def save_training_config():
         'LEARNING_RATE': LEARNING_RATE,
         'FINETUNE_EPOCHS': FINETUNE_EPOCHS,
         'DROPOUT': DROPOUT,
-        'MIXUP_ALPHA': MIXUP_ALPHA,
+        'MIXUP_ALPHA': MIXUP_ALPHA,  # Always 0.0 (disabled) - kept for config completeness
         'NUM_WORKERS': NUM_WORKERS,
         'PREFETCH_FACTOR': PREFETCH_FACTOR,
         'FOCAL_ALPHA': FOCAL_ALPHA,
@@ -1951,8 +1950,11 @@ def main():
         
         print(f"   Pneumonia - Train: {len(pneu_train_paths):,} | Val: {len(pneu_val_paths):,} | Test: {len(pneu_test_paths):,}")
         
-        # Create custom Pneumonia datasets from fixed paths
-        class PneumoniaCustomDataset(Dataset):
+        # ✅ CONSOLIDATED: CSV-based Pneumonia dataset (shares logic with PneumoniaDataset above)
+        # Note: Main PneumoniaDataset (line ~1057) is for directory structure
+        # This class is for CSV-based splits (more flexible for stratified sampling)
+        class PneumoniaCSVDataset(Dataset):
+            """Lightweight CSV-based Pneumonia dataset for stratified splits"""
             def __init__(self, image_paths, labels, transform=None, return_masks=True):
                 self.image_paths = image_paths
                 self.labels_list = labels
@@ -2000,9 +2002,9 @@ def main():
         pneu_val_df = pd.read_csv(pneumonia_fixed_val)
         pneu_test_df = pd.read_csv(pneumonia_fixed_test)
         
-        pneumonia_train = PneumoniaCustomDataset(pneu_train_df['image_path'].tolist(), pneu_train_df['label'].tolist(), train_transform)
-        pneumonia_valid = PneumoniaCustomDataset(pneu_val_df['image_path'].tolist(), pneu_val_df['label'].tolist(), val_transform)
-        pneumonia_test = PneumoniaCustomDataset(pneu_test_df['image_path'].tolist(), pneu_test_df['label'].tolist(), val_transform)
+        pneumonia_train = PneumoniaCSVDataset(pneu_train_df['image_path'].tolist(), pneu_train_df['label'].tolist(), train_transform)
+        pneumonia_valid = PneumoniaCSVDataset(pneu_val_df['image_path'].tolist(), pneu_val_df['label'].tolist(), val_transform)
+        pneumonia_test = PneumoniaCSVDataset(pneu_test_df['image_path'].tolist(), pneu_test_df['label'].tolist(), val_transform)
         
         print("\n" + "="*70)
         print("80/10/10 SPLITS CREATED & PERSISTED")
