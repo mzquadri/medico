@@ -4,13 +4,16 @@ PHASE 4: MASKED FOCAL LOSS FINE-TUNING
 Fine-tune Phase 3 checkpoint with uncertainty masking:
 
 1. MaskedSmoothedFocalLoss: Ignore uncertain (-1) labels in CheXpert
-2. Mask-aware mixup: Handle mixed masks correctly
-3. CheXpert NaN→0, -1→masked (not false negative)
+2. Mask-aware loss: Handle uncertain/missing labels correctly
+3. CheXpert: NaN→masked (configurable), -1→masked (uncertain)
 4. NIH: All masks = 1 (all certain)
    Pneumonia: Only Pneumonia mask = 1, rest = 0 (UNKNOWN, not false negatives)
-5. Fine-tune from Epoch 16 checkpoint
+5. Fine-tune from Phase 3 checkpoint
 6. Low LR (5e-6), low dropout (0.25), no mixup
-7. CPU-friendly: No gradient checkpointing
+7. Optimized for Intel Arc / DirectML
+
+Note: CHEXPERT_NAN_IS_UNKNOWN=True (medically safer, may improve Cardiomegaly)
+      Set to False for strict "NaN→0" spec (treats NaN as certain negative)
 
 Target: Fix Cardiomegaly performance by handling uncertain labels correctly
 """
@@ -1287,9 +1290,20 @@ def create_model(num_classes=5):
             checkpoint_classes = num_classes
         
         if checkpoint_classes == num_classes:
-            # Same number of classes - load full model
-            model.load_state_dict(state)
-            print(f"Loaded full model (same {num_classes} classes)")
+            # Same number of classes - try full load first, fallback to backbone-only
+            try:
+                model.load_state_dict(state, strict=False)
+                print(f"Loaded full model (same {num_classes} classes)")
+            except RuntimeError as e:
+                print(f"Full load failed (likely classifier structure mismatch): {e}")
+                print(f"Falling back to backbone-only load...")
+                # Load backbone only if full load fails
+                filtered = {k: v for k, v in state.items() if not k.startswith('classifier.')}
+                missing, unexpected = model.load_state_dict(filtered, strict=False)
+                print(f"Loaded backbone only (classifier re-initialized for {num_classes} classes)")
+                if missing:
+                    classifier_missing = [k for k in missing if k.startswith('classifier.')]
+                    print(f"  Classifier keys re-initialized: {len(classifier_missing)} items")
         else:
             # Different number of classes - load backbone only
             filtered = {k: v for k, v in state.items() if not k.startswith('classifier.')}
@@ -2344,11 +2358,15 @@ def main():
             }
             
             # Save emergency checkpoint before validation (prevents loss if validation crashes)
+            # Move to CPU for DirectML/XPU serialization safety
             emergency_checkpoint = os.path.join(CHECKPOINT_DIR, f"emergency_epoch_{epoch}.pt")
+            state_dict_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            optimizer_state_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
+                                   for k, v in optimizer.state_dict().items()}
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
+                'model_state_dict': state_dict_cpu,
+                'optimizer_state_dict': optimizer_state_cpu,
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': train_loss,
                 'best_auc': best_auc
@@ -2517,8 +2535,8 @@ def main():
                 print(f"NIH AUC:                     {nih_auc:.4f}")
                 print(f"CheXpert AUC:                {chexpert_auc:.4f}")
                 print(f"Pneumonia AUC:               {pneumonia_auc:.4f}")
-                print(f"Mean AUC:                    {mean_auc:.4f}")
-                print(f"Min AUC (Core 14):           {min_auc_core:.4f}")
+                print(f"Mean AUC (weighted):         {mean_auc:.4f}")
+                print(f"Min AUC (NIH 14-diseases):   {min_auc_core:.4f}")
                 print(f"Min AUC (Global):            {min_auc:.4f} <- CHECKPOINT (Best: {best_auc:.4f})")
                 print(f"Learning Rate:               {optimizer.param_groups[0]['lr']:.2e}")
                 print("="*70)
@@ -2529,10 +2547,15 @@ def main():
                     patience_counter = 0
                     epoch_data["is_best"] = True
                     
+                    # Move to CPU for DirectML/XPU serialization safety
+                    state_dict_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                    optimizer_state_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
+                                           for k, v in optimizer.state_dict().items()}
+                    
                     checkpoint = {
                         'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
+                        'model_state_dict': state_dict_cpu,
+                        'optimizer_state_dict': optimizer_state_cpu,
                         'scheduler_state_dict': scheduler.state_dict(),
                         'best_auc': best_auc,
                         'min_auc': min_auc,
@@ -2546,8 +2569,8 @@ def main():
                     }
                     
                     torch.save(checkpoint, BEST_MODEL_OUT)
-                    print(f"\n🎉 NEW BEST MODEL SAVED! Min AUC: {min_auc:.4f}")
-                    print(f"   Core (NIH+CheXpert 14 diseases): {min_auc_core:.4f}")
+                    print(f"\nNEW BEST MODEL SAVED! Min AUC: {min_auc:.4f}")
+                    print(f"   Core (NIH 14 diseases):         {min_auc_core:.4f}")
                     print(f"   Pneumonia (Pneumonia):          {pneu_pneu_auc:.4f}")
                     
                     # Clean up ALL emergency checkpoints after successful best model save
