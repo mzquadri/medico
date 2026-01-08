@@ -199,7 +199,7 @@ CHEXPERT_NAN_IS_UNKNOWN = True  # Try True first for best Cardiomegaly AUC
 # Paths
 CHEXPERT_ROOT = r"C:\Users\MohdZaminQuadri\Downloads\Medico-Xray\datasets\chexpert"
 CHEXPERT_TRAIN_CSV = os.path.join(CHEXPERT_ROOT, "train.csv")  # Will be split 80/10/10
-CHEXPERT_VALID_CSV = os.path.join(CHEXPERT_ROOT, "valid.csv")  # Original small validation (unused)
+# Note: Original valid.csv not used - we create our own patient-level splits
 
 NIH_IMAGE_DIR = r"C:\Users\MohdZaminQuadri\Downloads\Medico-Xray\datasets\nih\images\images"
 # Fixed: CSV file is inside Data_Entry_2017.csv directory (directory name, not file!)
@@ -218,9 +218,6 @@ DETAILED_LOG_FILE = os.path.join(CHECKPOINT_DIR, 'training_log_detailed.json')
 RESUME_FROM_BEST = True  # PHASE 4: Fine-tune from Phase 3 Epoch 16 checkpoint
 BEST_CHECKPOINT = os.path.join(PHASE3_DIR, "best_model_phase3_fulldata.pt")
 BEST_MODEL_OUT = os.path.join(CHECKPOINT_DIR, "best_model_phase4_masked.pt")
-
-LOG_DIR = "logs_phase3"
-os.makedirs(LOG_DIR, exist_ok=True)
 
 # ============================================================================
 # REPRODUCIBILITY
@@ -1373,22 +1370,11 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, epoc
         else:
             accum_in_window = ACCUMULATION_STEPS
         
-        # MixUp augmentation (mask-aware)
-        if MIXUP_ALPHA > 0 and random.random() < 0.5:
-            images, labels_a, labels_b, masks_a, masks_b, lam = mixup_data(images, labels, masks, MIXUP_ALPHA)
-            do_mixup = True
-        else:
-            labels_a, labels_b, masks_a, masks_b, lam = labels, None, masks, None, 1.0
-            do_mixup = False
-        
         # Forward pass with AMP
         if AMP_ENABLED and scaler:
             with autocast():
                 outputs = model(images)
-                if do_mixup:
-                    loss = mixup_criterion_masked(criterion, outputs, labels_a, labels_b, masks_a, masks_b, lam)
-                else:
-                    loss = criterion(outputs, labels_a, masks)
+                loss = criterion(outputs, labels, masks)
                 loss = loss / accum_in_window  # Use correct window size
             
             scaler.scale(loss).backward()
@@ -1410,10 +1396,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, epoc
                     scheduler.step(ep_rel + (batch_idx + 1) / num_batches)
         else:
             outputs = model(images)
-            if do_mixup:
-                loss = mixup_criterion_masked(criterion, outputs, labels_a, labels_b, masks_a, masks_b, lam)
-            else:
-                loss = criterion(outputs, labels_a, masks)  # Pass masks
+            loss = criterion(outputs, labels, masks)  # Pass masks
             loss = loss / accum_in_window  # Use correct window size
             
             loss.backward()
@@ -1474,11 +1457,7 @@ def validate(model, loader, dataset_name=""):
             if str(DEVICE) == "cuda" and images.dim() == 4:
                 images = images.to(memory_format=torch.channels_last)
             
-            # Test-Time Augmentation (optional, ~2x slower but can improve AUC)
-            if USE_TTA:
-                outputs = (model(images) + model(torch.flip(images, [3]))) / 2
-            else:
-                outputs = model(images)
+            outputs = model(images)
             
             probs = torch.sigmoid(outputs).cpu().numpy()
             
@@ -1921,8 +1900,6 @@ def main():
                                 all_images.append({'image_path': img_path, 'label': label})
             
             # Stratified shuffle and split 70/15/15 (class-balanced)
-            from sklearn.model_selection import train_test_split
-            
             # Separate by class for stratified sampling
             normal_images = [x for x in all_images if x['label'] == 0.0]
             pneumonia_images = [x for x in all_images if x['label'] == 1.0]
