@@ -601,6 +601,34 @@ def cleanup_emergency_checkpoints(keep_latest=0):
     except Exception as e:
         print(f"Warning: Emergency checkpoint cleanup failed: {e}")
 
+def to_cpu(obj):
+    """
+    Recursively move all tensors in nested structure to CPU.
+    
+    Handles optimizer/scheduler state dicts which have deeply nested tensors.
+    Critical for DirectML/XPU checkpoint saving (prevents device tensor corruption).
+    
+    Args:
+        obj: Any object (tensor, dict, list, tuple, primitive)
+    
+    Returns:
+        Same structure with all tensors moved to CPU
+        
+    Example:
+        >>> optimizer_state = optimizer.state_dict()  # Has nested device tensors
+        >>> cpu_state = to_cpu(optimizer_state)       # All tensors now on CPU
+        >>> torch.save(cpu_state, 'checkpoint.pt')    # Safe to save
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    elif isinstance(obj, dict):
+        return {k: to_cpu(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        converted = [to_cpu(v) for v in obj]
+        return tuple(converted) if isinstance(obj, tuple) else converted
+    else:
+        return obj  # Primitives (int, float, str, None, etc.)
+
 # ============================================================================
 # MASKED FOCAL LOSS WITH LABEL SMOOTHING (PHASE 4)
 # ============================================================================
@@ -2358,16 +2386,13 @@ def main():
             }
             
             # Save emergency checkpoint before validation (prevents loss if validation crashes)
-            # Move to CPU for DirectML/XPU serialization safety
+            # CRITICAL: Use to_cpu() to recursively move all nested tensors to CPU (DirectML/XPU safety)
             emergency_checkpoint = os.path.join(CHECKPOINT_DIR, f"emergency_epoch_{epoch}.pt")
-            state_dict_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-            optimizer_state_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
-                                   for k, v in optimizer.state_dict().items()}
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': state_dict_cpu,
-                'optimizer_state_dict': optimizer_state_cpu,
-                'scheduler_state_dict': scheduler.state_dict(),
+                'model_state_dict': to_cpu(model.state_dict()),
+                'optimizer_state_dict': to_cpu(optimizer.state_dict()),
+                'scheduler_state_dict': to_cpu(scheduler.state_dict()),
                 'train_loss': train_loss,
                 'best_auc': best_auc
             }, emergency_checkpoint)
@@ -2547,16 +2572,12 @@ def main():
                     patience_counter = 0
                     epoch_data["is_best"] = True
                     
-                    # Move to CPU for DirectML/XPU serialization safety
-                    state_dict_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-                    optimizer_state_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
-                                           for k, v in optimizer.state_dict().items()}
-                    
+                    # CRITICAL: Use to_cpu() to recursively move all nested tensors to CPU (DirectML/XPU safety)
                     checkpoint = {
                         'epoch': epoch,
-                        'model_state_dict': state_dict_cpu,
-                        'optimizer_state_dict': optimizer_state_cpu,
-                        'scheduler_state_dict': scheduler.state_dict(),
+                        'model_state_dict': to_cpu(model.state_dict()),
+                        'optimizer_state_dict': to_cpu(optimizer.state_dict()),
+                        'scheduler_state_dict': to_cpu(scheduler.state_dict()),
                         'best_auc': best_auc,
                         'min_auc': min_auc,
                         'min_auc_core': min_auc_core,
@@ -2626,12 +2647,13 @@ def main():
     except KeyboardInterrupt:
         print("\n\nTraining interrupted by user. Saving checkpoint...")
         if 'epoch' in locals() and 'model' in locals():
+            # CRITICAL: Use to_cpu() to recursively move all nested tensors to CPU (DirectML/XPU safety)
             emergency_save_path = os.path.join(CHECKPOINT_DIR, 'interrupted_checkpoint.pt')
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict() if 'optimizer' in locals() else None,
-                'scheduler_state_dict': scheduler.state_dict() if 'scheduler' in locals() else None,
+                'model_state_dict': to_cpu(model.state_dict()),
+                'optimizer_state_dict': to_cpu(optimizer.state_dict()) if 'optimizer' in locals() else None,
+                'scheduler_state_dict': to_cpu(scheduler.state_dict()) if 'scheduler' in locals() else None,
                 'best_auc': best_auc if 'best_auc' in locals() else 0.0
             }, emergency_save_path)
             print(f"Emergency checkpoint saved to: {emergency_save_path}")
