@@ -479,6 +479,62 @@ def chex_cardio_raw_stats(df, split_name="Train"):
         print(f"     Masking strategy CAN improve Cardiomegaly")
     print(f"{'='*70}\n")
 
+def verify_sampled_cardio_counts(loader, dataset_name="CheXpert Val"):
+    """
+    Verify sampled validation set has enough Cardiomegaly pos/neg for stable AUC. 
+    
+    CRITICAL: Sampled subset must preserve Cardiomegaly distribution. 
+    If pos<50 or neg<50, AUC will be noisy/unstable.
+    """
+    cardio_idx = LABEL_TO_IDX.get("Cardiomegaly")
+    if cardio_idx is None: 
+        print(f"[WARNING] Cardiomegaly not in label set")
+        return
+    
+    pos_count = 0
+    neg_count = 0
+    certain_count = 0
+    
+    print(f"\n{'='*70}")
+    print(f"SAMPLED VALIDATION CARDIOMEGALY VERIFICATION ({dataset_name})")
+    print(f"{'='*70}")
+    
+    # Iterate through sampled loader to count
+    for batch in loader:
+        if len(batch) == 3:
+            _, labels, masks = batch
+        else:
+            _, labels = batch
+            masks = torch.ones_like(labels)
+        
+        # Only count certain labels (mask=1)
+        keep = (masks[:, cardio_idx] == 1)
+        y_cardio = labels[keep, cardio_idx]
+        
+        pos_count += int((y_cardio == 1).sum())
+        neg_count += int((y_cardio == 0).sum())
+        certain_count += int(keep.sum())
+    
+    print(f"  Certain samples:   {certain_count:,}")
+    print(f"  Positive:          {pos_count:,}  ({pos_count/max(1, certain_count)*100:.1f}% of certain)")
+    print(f"  Negative:          {neg_count:,}  ({neg_count/max(1, certain_count)*100:.1f}% of certain)")
+    
+    # CRITICAL CHECKS
+    if pos_count < 50:
+        print(f"\n  [WARNING] Only {pos_count} Cardiomegaly positives in sampled val set!")
+        print(f"     Recommendation: Increase val_sample_size to 2000-3000")
+        print(f"     Current AUC monitoring will be NOISY")
+    
+    if neg_count < 50:
+        print(f"\n  [WARNING] Only {neg_count} Cardiomegaly negatives in sampled val set!")
+        print(f"     Recommendation: Increase val_sample_size to 2000-3000")
+        print(f"     Current AUC monitoring will be NOISY")
+    
+    if pos_count >= 50 and neg_count >= 50:
+        print(f"\n  [INFO] Sufficient Cardiomegaly samples for stable AUC monitoring")
+    
+    print(f"{'='*70}\n")
+
 def validate_training_setup(model, train_loader, criterion, optimizer):
     """Test training setup with one batch (no weight update)"""
     print("\nValidating training setup...")
@@ -1367,10 +1423,16 @@ def create_model(num_classes=5):
                 print(f"[SUCCESS] FULL MODEL LOADED (including all {len(classifier_keys_in_model)} classifier weights)")
                 print(f"   Fine-tuning FROM Phase-3 trained head")
             else:
-                print(f"[WARNING] PARTIAL LOAD: {len(classifier_missing)} classifier keys missing")
-                print(f"   Training with RANDOM classifier head (slower convergence)")
-                if len(classifier_missing) <= 5:
-                    print(f"   Missing: {classifier_missing}")
+                print(f"[CRITICAL ERROR] Phase-3 classifier NOT loaded ({len(classifier_missing)} keys missing)")
+                print(f"   Missing keys: {classifier_missing}")
+                print(f"\nPhase-4 requires fine-tuning FROM Phase-3 trained head.")
+                print(f"Either:")
+                print(f"  1. Use a Phase-3 checkpoint with matching classifier architecture")
+                print(f"  2. Modify Phase-4 classifier to match Phase-3 (recommended)")
+                raise RuntimeError(
+                    f"Phase-3 classifier load failed. Cannot train Phase-4 with random head. "
+                    f"Missing {len(classifier_missing)} classifier keys."
+                )
         else:
             # Different number of classes - load backbone only
             filtered = {k: v for k, v in state.items() if not k.startswith('classifier.')}
@@ -1768,10 +1830,19 @@ def phase4_single_check(chex_train, chex_val, nih_train, nih_val, pneu_train, pn
     ok("CheXpert val Cardiomegaly has enough certain samples", int(keep.sum()) >= 100)
     ok("CheXpert val Cardiomegaly has both classes", pos >= 20 and neg >= 20)
 
-    # 7) Masking actually active (not ~0% masked)
+    # 7) Masking actually meaningful (not trivially small)
     unc = float((chex_train.masks[:, cardio] == 0).mean())
-    # Relaxed threshold: Just check masking is active (handles low-uncertainty datasets)
-    ok("CheXpert train Cardiomegaly has some masked labels", unc > 0.0)
+    # Require >=2% masked for masking strategy to have real effect
+    ok("CheXpert train Cardiomegaly has meaningful masked labels (>=2%)", unc >= 0.02)
+
+    # Also print the actual rate for diagnostics
+    if unc < 0.02:
+        print(f"   DETECTED: Only {unc*100:.2f}% masked - masking unlikely to help")
+        print(f"   Consider: Try U-Ones or U-SoftLabel strategies instead")
+    elif unc < 0.10:
+        print(f"   DETECTED: {unc*100:.1f}% masked - moderate masking effect expected")
+    else:
+        print(f"   DETECTED: {unc*100:.1f}% masked - strong masking effect expected")
 
     print("PHASE-4 SINGLE CHECK PASSED")
     print("="*70 + "\n")
@@ -2256,6 +2327,9 @@ def main():
         chexpert_val_loader = create_stratified_sampled_loader(
             chexpert_valid, sample_size=val_sample_size, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS
         )
+        
+        # Verify Cardiomegaly distribution in sampled validation set
+        verify_sampled_cardio_counts(chexpert_val_loader, "CheXpert Val (Sampled)")
         
         # NIH: FULL validation (no sampling) to ensure rare diseases have enough positives
         # (Hernia only has 15 val samples, sampling could drop all positives!)
