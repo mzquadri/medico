@@ -446,6 +446,39 @@ def quick_image_path_sanity(dataset, name, n=2000):
     else:
         print(f"  All sampled paths verified")
 
+def chex_cardio_raw_stats(df, split_name="Train"):
+    """Print raw CheXpert Cardiomegaly distribution to verify masking data exists"""
+    if 'Cardiomegaly' not in df.columns:
+        print(f"[WARNING] Cardiomegaly column not found in {split_name}")
+        return
+    
+    x = df['Cardiomegaly'].values
+    n = len(x)
+    n_nan = np.isnan(x).sum()
+    n_uncertain = (x == -1).sum()
+    n_pos = (x == 1).sum()
+    n_neg = (x == 0).sum()
+    
+    print(f"{'='*70}")
+    print(f"RAW CHEXPERT CARDIOMEGALY DISTRIBUTION ({split_name})")
+    print(f"{'='*70}")
+    print(f"  Total:           {n:,}")
+    print(f"  Positive (1):   {n_pos:,}  ({n_pos/n*100:.1f}%)")
+    print(f"  Negative (0):   {n_neg:,}  ({n_neg/n*100:.1f}%)")
+    print(f"  Uncertain (-1): {n_uncertain:,}  ({n_uncertain/n*100:.1f}%)")
+    print(f"  NaN:             {n_nan:,}  ({n_nan/n*100:.1f}%)")
+    
+    # CRITICAL DIAGNOSTIC
+    maskable = n_uncertain + n_nan
+    if maskable == 0:
+        print(f"\n  [CRITICAL] NO uncertain or NaN labels!")
+        print(f"     Phase-4 masking will have NO EFFECT on Cardiomegaly")
+        print(f"     Recommendation: Try U-Ones strategy instead")
+    else:
+        print(f"\n  [INFO] {maskable:,} labels will be masked ({maskable/n*100:.1f}%)")
+        print(f"     Masking strategy CAN improve Cardiomegaly")
+    print(f"{'='*70}\n")
+
 def validate_training_setup(model, train_loader, criterion, optimizer):
     """Test training setup with one batch (no weight update)"""
     print("\nValidating training setup...")
@@ -688,8 +721,9 @@ class MaskedSmoothedFocalLoss(nn.Module):
         # Binary cross entropy per element
         bce = F.binary_cross_entropy_with_logits(logits, t_smooth, reduction="none")
 
-        # Probabilities for focal term (use hard targets for p_t stability)
-        p = torch.sigmoid(logits)
+        # Probabilities for focal term (clamp for numerical stability)
+        # Prevents focal collapse on extremely confident predictions
+        p = torch.sigmoid(logits).clamp(1e-6, 1 - 1e-6)
         p_t = p * t_hard + (1.0 - p) * (1.0 - t_hard)  # (N, C)
 
         # Alpha per element (hard targets)
@@ -1318,20 +1352,25 @@ def create_model(num_classes=5):
             checkpoint_classes = num_classes
         
         if checkpoint_classes == num_classes:
-            # Same number of classes - try full load first, fallback to backbone-only
-            try:
-                model.load_state_dict(state, strict=False)
-                print(f"Loaded full model (same {num_classes} classes)")
-            except RuntimeError as e:
-                print(f"Full load failed (likely classifier structure mismatch): {e}")
-                print(f"Falling back to backbone-only load...")
-                # Load backbone only if full load fails
-                filtered = {k: v for k, v in state.items() if not k.startswith('classifier.')}
-                missing, unexpected = model.load_state_dict(filtered, strict=False)
-                print(f"Loaded backbone only (classifier re-initialized for {num_classes} classes)")
-                if missing:
-                    classifier_missing = [k for k in missing if k.startswith('classifier.')]
-                    print(f"  Classifier keys re-initialized: {len(classifier_missing)} items")
+            # Same number of classes - try full load and CHECK what loaded
+            missing_keys, unexpected_keys = model.load_state_dict(state, strict=False)
+            
+            # DIAGNOSTIC: Check if classifier actually loaded
+            classifier_keys_in_checkpoint = [k for k in state.keys() if k.startswith('classifier.')]
+            classifier_keys_in_model = [k for k in model.state_dict().keys() if k.startswith('classifier.')]
+            classifier_missing = [k for k in classifier_keys_in_model if k not in state]
+            
+            print(f"Checkpoint has {len(classifier_keys_in_checkpoint)} classifier keys")
+            print(f"Model expects {len(classifier_keys_in_model)} classifier keys")
+            
+            if len(classifier_missing) == 0:
+                print(f"[SUCCESS] FULL MODEL LOADED (including all {len(classifier_keys_in_model)} classifier weights)")
+                print(f"   Fine-tuning FROM Phase-3 trained head")
+            else:
+                print(f"[WARNING] PARTIAL LOAD: {len(classifier_missing)} classifier keys missing")
+                print(f"   Training with RANDOM classifier head (slower convergence)")
+                if len(classifier_missing) <= 5:
+                    print(f"   Missing: {classifier_missing}")
         else:
             # Different number of classes - load backbone only
             filtered = {k: v for k, v in state.items() if not k.startswith('classifier.')}
@@ -1835,6 +1874,10 @@ def main():
             print(f"   Saved to: {chexpert_fixed_train}")
         
         print(f"   CheXpert - Train: {len(chexpert_train_df):,} | Val: {len(chexpert_val_df):,} | Test: {len(chexpert_test_df):,}")
+        
+        # Check raw Cardiomegaly distribution to verify masking data exists
+        chex_cardio_raw_stats(chexpert_train_df, "Train")
+        chex_cardio_raw_stats(chexpert_val_df, "Val")
         
         # Create CheXpert datasets
         chexpert_train_df.to_csv('temp_chexpert_train.csv', index=False)
