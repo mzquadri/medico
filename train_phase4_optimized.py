@@ -186,9 +186,9 @@ USE_FULL_PNEUMONIA = True    # Use all 5.2K images
 USE_GRADIENT_CHECKPOINTING = (IS_DIRECTML or str(DEVICE) == "xpu")  # Conditional: True for Arc/DirectML, False for CPU
 
 # Focal Loss - PHASE 4 OPTIMIZED
-FOCAL_ALPHA = 0.75      #  Positives get higher focus (was 0.25) - 3:1 ratio
+FOCAL_ALPHA = 0.75      # Positives get higher focus (was 0.25) - 3:1 ratio
 FOCAL_GAMMA = 2.0
-FOCAL_SMOOTHING = 0.02  #  Better for medical/noisy labels (was hardcoded 0.05)
+FOCAL_SMOOTHING = 0.02  # Better for medical/noisy labels (was hardcoded 0.05)
 
 # CheXpert NaN Handling Strategy (CRITICAL for Cardiomegaly!)
 # False: NaN → 0 (supervised negative) - strict Phase-4 spec
@@ -314,6 +314,7 @@ def save_training_config():
         'FINETUNE_EPOCHS': FINETUNE_EPOCHS,
         'DROPOUT': DROPOUT,
         'MIXUP_ALPHA': MIXUP_ALPHA,  # Always 0.0 (disabled) - kept for config completeness
+        'CHEXPERT_NAN_IS_UNKNOWN': CHEXPERT_NAN_IS_UNKNOWN,  # Critical: NaN masking strategy
         'NUM_WORKERS': NUM_WORKERS,
         'PREFETCH_FACTOR': PREFETCH_FACTOR,
         'FOCAL_ALPHA': FOCAL_ALPHA,
@@ -337,7 +338,7 @@ def print_dataset_stats(dataset_name, dataset, selected_labels):
     # Try precomputed labels first (NIH, CheXpert)
     if hasattr(dataset, 'labels'):
         labels_matrix = dataset.labels
-        # ✅ MASK-AWARE: Only count positives where mask=1 (correct for CheXpert)
+        # MASK-AWARE: Only count positives where mask=1 (correct for CheXpert)
         if hasattr(dataset, 'masks'):
             masks_matrix = dataset.masks
         else:
@@ -559,18 +560,43 @@ def cleanup_temp_files():
                 print(f"Warning: Could not remove {temp_file}: {e}")
     
     # Keep only latest 2 emergency checkpoints
+    cleanup_emergency_checkpoints(keep_latest=2)
+
+def cleanup_emergency_checkpoints(keep_latest=0):
+    """
+    Clean up emergency checkpoint files, optionally keeping N most recent.
+    
+    Args:
+        keep_latest: Number of recent emergency checkpoints to keep (default: 0 = delete all)
+    """
     try:
-        emergency_checkpoints = []
-        for file in os.listdir(CHECKPOINT_DIR):
-            if file.startswith('emergency_epoch_'):
-                emergency_checkpoints.append(os.path.join(CHECKPOINT_DIR, file))
+        emergency_files = [
+            f for f in os.listdir(CHECKPOINT_DIR) 
+            if f.startswith('emergency_epoch_')
+        ]
         
-        emergency_checkpoints.sort(key=os.path.getctime, reverse=True)
-        for checkpoint in emergency_checkpoints[2:]:
-            os.remove(checkpoint)
-            print(f"Cleaned up old checkpoint: {os.path.basename(checkpoint)}")
+        if not emergency_files:
+            return
+        
+        # Sort by creation time (newest first)
+        emergency_files.sort(
+            key=lambda f: os.path.getctime(os.path.join(CHECKPOINT_DIR, f)), 
+            reverse=True
+        )
+        
+        # Delete old files beyond keep_latest
+        for file in emergency_files[keep_latest:]:
+            try:
+                os.remove(os.path.join(CHECKPOINT_DIR, file))
+            except Exception as e:
+                print(f"Warning: Could not remove {file}: {e}")
+        
+        deleted_count = len(emergency_files) - min(keep_latest, len(emergency_files))
+        if deleted_count > 0:
+            print(f"Cleaned up {deleted_count} emergency checkpoint(s)")
+            
     except Exception as e:
-        print(f"Warning: Checkpoint cleanup issue: {e}")
+        print(f"Warning: Emergency checkpoint cleanup failed: {e}")
 
 # ============================================================================
 # MASKED FOCAL LOSS WITH LABEL SMOOTHING (PHASE 4)
@@ -611,7 +637,7 @@ class MaskedSmoothedFocalLoss(nn.Module):
         # Ensure float tensors
         targets = targets.float()
         
-        # ✅ SAFETY: Clamp targets to valid BCE range (protects against any dataset bug)
+        # SAFETY: Clamp targets to valid BCE range (protects against any dataset bug)
         # Prevents inf/nan from negative or >1 values (e.g., if -1 leaks through)
         targets = targets.clamp(0.0, 1.0)
 
@@ -641,7 +667,7 @@ class MaskedSmoothedFocalLoss(nn.Module):
         # Focal core term
         focal = alpha_t * ((1.0 - p_t).clamp_min(1e-6) ** self.gamma) * bce  # (N, C)
 
-        # ✅ CRITICAL: Positive-only class weights
+        # CRITICAL: Positive-only class weights
         # Only positives get boosted (prevents negative flooding)
         if self.class_weights is not None:
             cw = self.class_weights.to(focal.device).view(1, -1)  # (1, C)
@@ -654,7 +680,7 @@ class MaskedSmoothedFocalLoss(nn.Module):
         # Mask uncertain/unknown labels
         focal = focal * masks
 
-        # ✅ Proper normalization (mask + weight aware)
+        # Proper normalization (mask + weight aware)
         denom = (masks * weight_mat).sum().clamp_min(1e-6)
         return focal.sum() / denom
 
@@ -696,7 +722,7 @@ def create_stratified_sampled_loader(dataset, sample_size=3000, batch_size=8, nu
         # Multi-label case: use first CERTAIN positive label for stratification
         labels = dataset.labels
         
-        # ✅ MASK-AWARE: Only consider positives where mask==1 (certain)
+        # MASK-AWARE: Only consider positives where mask==1 (certain)
         if hasattr(dataset, 'masks') and isinstance(dataset.masks, np.ndarray):
             masks = dataset.masks
         else:
@@ -800,12 +826,12 @@ def get_transforms(train=True, enable_clahe=True):
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomRotation(10),
             transforms.ToTensor(),
-            transforms.Normalize([0.485], [0.229])  # ImageNet-compatible stats for better transfer
+            transforms.Normalize([0.485], [0.229])  # ImageNet grayscale approx (not chest-xray specific, but works well with transfer learning)
         ])
         
         return transforms.Compose(transforms_list)
     else:
-        #  CRITICAL: Match training preprocessing to avoid distribution shift
+        # CRITICAL: Match training preprocessing to avoid distribution shift
         # Validation must use SAME transforms as training (except data augmentation)
         transforms_list = [
             transforms.Resize(256),  # Standard: 256 for 224 crops
@@ -818,7 +844,7 @@ def get_transforms(train=True, enable_clahe=True):
         
         transforms_list.extend([
             transforms.ToTensor(),
-            transforms.Normalize([0.485], [0.229])  # ImageNet-compatible stats
+            transforms.Normalize([0.485], [0.229])  # ImageNet grayscale approx (matches training normalization)
         ])
         
         return transforms.Compose(transforms_list)
@@ -874,7 +900,7 @@ class CheXpertDataset(Dataset):
                 nih_idx = LABEL_TO_IDX[nih_name]
                 col_data = self.df[chexpert_name].to_numpy(dtype=np.float32)
                 
-                # ✅ CONFIGURABLE NaN HANDLING (CRITICAL for Cardiomegaly!)
+                # CONFIGURABLE NaN HANDLING (CRITICAL for Cardiomegaly!)
                 # Phase-4 spec: NaN → 0 (supervised), -1 → masked
                 # Medical reality: NaN often means UNKNOWN, not "definitely negative"
                 # Toggle CHEXPERT_NAN_IS_UNKNOWN to test both strategies
@@ -893,7 +919,7 @@ class CheXpertDataset(Dataset):
                 
                 self.masks[:, nih_idx] = mask.astype(np.float32)
                 
-                # ✅ CRITICAL: Clean labels (NaN→0, -1→0) regardless of masking strategy
+                # CRITICAL: Clean labels (NaN→0, -1→0) regardless of masking strategy
                 col_clean = np.nan_to_num(col_data, nan=0.0)
                 col_clean[is_uncertain] = 0.0  # Force -1 to 0
                 self.labels[:, nih_idx] = col_clean.astype(np.float32)
@@ -908,7 +934,7 @@ class CheXpertDataset(Dataset):
                 self.masks[:, j] = 0.0  # ignore loss/metrics for this disease on CheXpert
                 self.labels[:, j] = 0.0  # value irrelevant because mask=0
         
-        # ✅ POST-CHECK: Ensure masked entries have label=0 (catches regressions)
+        # POST-CHECK: Ensure masked entries have label=0 (catches regressions)
         # Prevents class weight corruption and BCE inf/nan issues
         bad = (self.masks == 0) & (self.labels != 0)
         if bad.any():
@@ -924,7 +950,7 @@ class CheXpertDataset(Dataset):
         try:
             row = self.df.iloc[idx]
             
-            # ✅ ROBUST PATH RESOLUTION: Try multiple strategies to find image
+            # ROBUST PATH RESOLUTION: Try multiple strategies to find image
             rel_path = row['Path']
             rel_path_normalized = rel_path.replace('/', os.sep)
             
@@ -1053,6 +1079,12 @@ class NIHDataset(Dataset):
                 return image, labels, mask
             return image, labels
 
+# ============================================================================
+# PNEUMONIA DATASET (DIRECTORY-BASED)
+# ============================================================================
+# NOTE: This class is DEPRECATED - not used in current training pipeline.
+# Use PneumoniaCSVDataset instead (defined in main() for stratified splits).
+# Kept for backward compatibility only.
 class PneumoniaDataset(Dataset):
     def __init__(self, root_dir, split='train', transform=None, return_masks=True):
         self.root_dir = root_dir
@@ -1098,7 +1130,7 @@ class PneumoniaDataset(Dataset):
                 raise ValueError("Pneumonia not in SELECTED_LABELS! Check configuration.")
             
             if self.return_masks:
-                # ✅ CRITICAL FIX: Only Pneumonia disease is labeled
+                # CRITICAL FIX: Only Pneumonia disease is labeled
                 # Other diseases are UNKNOWN (not certain negatives)
                 mask = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)
                 mask[pneumonia_idx] = 1.0  # Only Pneumonia is certain
@@ -1242,7 +1274,7 @@ def create_model(num_classes=5):
         
         state = checkpoint['model_state_dict']
         
-        # ✅ ROBUST: Find last classifier Linear layer (handles any classifier structure)
+        # ROBUST: Find last classifier Linear layer (handles any classifier structure)
         checkpoint_classes = None
         classifier_weights = [k for k in state.keys() if k.startswith('classifier.') and k.endswith('.weight')]
         if classifier_weights:
@@ -1565,9 +1597,11 @@ def compute_class_weights_mask_aware(nih_ds, chex_ds, pneu_ds, cap=10.0):
     # CRITICAL FIX: Pneumonia dataset only labels Pneumonia disease
     # Other diseases are UNKNOWN (not certain negatives)
     pneu_idx = LABEL_TO_IDX["Pneumonia"]
-    pneu_pos = float(np.sum(getattr(pneu_ds, "labels_list", [])))
+    if not hasattr(pneu_ds, "labels_list"):
+        raise AttributeError(f"Pneumonia dataset missing 'labels_list' attribute (type: {type(pneu_ds).__name__})")
+    pneu_pos = float(np.sum(pneu_ds.labels_list))
     pos[pneu_idx] += pneu_pos
-    certain[pneu_idx] += len(pneu_ds)  #  Only Pneumonia gets certainty boost
+    certain[pneu_idx] += len(pneu_ds)  # Only Pneumonia gets certainty boost
 
     weights = []
     print(f"\n{'='*70}")
@@ -1606,7 +1640,7 @@ def phase4_single_check(chex_train, chex_val, nih_train, nih_val, pneu_train, pn
     pneu_i = LABEL_TO_IDX["Pneumonia"]
 
     def ok(name, cond):
-        status = "✅" if cond else "❌"
+        status = "PASS" if cond else "FAIL"
         print(f"{status} {name}")
         if not cond:
             raise RuntimeError(f"Phase-4 single check FAILED at: {name}")
@@ -1655,10 +1689,10 @@ def phase4_single_check(chex_train, chex_val, nih_train, nih_val, pneu_train, pn
 
     # 7) Masking actually active (not ~0% masked)
     unc = float((chex_train.masks[:, cardio] == 0).mean())
-    # ✅ Relaxed threshold: Just check masking is active (handles low-uncertainty datasets)
+    # Relaxed threshold: Just check masking is active (handles low-uncertainty datasets)
     ok("CheXpert train Cardiomegaly has some masked labels", unc > 0.0)
 
-    print("✅ PHASE-4 SINGLE CHECK PASSED")
+    print("PHASE-4 SINGLE CHECK PASSED")
     print("="*70 + "\n")
 
 # ============================================================================
@@ -1682,18 +1716,22 @@ def main():
         # Load datasets with optimized data loading
         print("\nLoading datasets...")
         
-        # CLAHE only disabled on Arc/DirectML/CPU (CPU bottleneck with NUM_WORKERS=0)
-        # CUDA has enough workers + CPU bandwidth, so CLAHE is beneficial
-        enable_train_clahe = (str(DEVICE) == "cuda") and (not IS_DIRECTML)
-        
-        if enable_train_clahe:
-            print("✅ CLAHE enabled for training (CUDA device - sufficient CPU bandwidth)")
+        # CLAHE Enable Decision (CPU bandwidth consideration)
+        # CUDA: Enable (workers + bandwidth available)
+        # DirectML/Arc/CPU: Disable (CPU bottleneck with limited workers)
+        if str(DEVICE) == "cuda" and not IS_DIRECTML:
+            enable_train_clahe = True
+            print("CLAHE enabled for training (CUDA device - sufficient CPU bandwidth)")
         else:
-            print("⚠️  CLAHE disabled for training (Arc/DirectML/CPU - CPU bottleneck)")
+            enable_train_clahe = False
+            if IS_DIRECTML or str(DEVICE) == "xpu":
+                print("WARNING: CLAHE disabled for training (DirectML/Arc - CPU bottleneck risk)")
+            else:
+                print("WARNING: CLAHE disabled for training (CPU device - transform bottleneck)")
         print("   Validation uses SAME preprocessing as training (no distribution shift)\n")
         
         train_transform = get_transforms(train=True, enable_clahe=enable_train_clahe)
-        val_transform = get_transforms(train=False, enable_clahe=enable_train_clahe)  # ✅ Match training preprocessing
+        val_transform = get_transforms(train=False, enable_clahe=enable_train_clahe)  # Match training preprocessing
         
         # ============================================================================
         # OPTIMIZED SPLITS: NIH 80/10/10 (Stratified), CheXpert 80/10/10, Pneumonia 70/15/15
@@ -1722,7 +1760,7 @@ def main():
             # Extract patient IDs from Path column (format: patient12345/study1/...)
             chexpert_df['Patient'] = chexpert_df['Path'].str.extract(r'(patient\d+)')
             
-            # ✅ CRITICAL FIX: Drop rows with NaN patient IDs (prevents data leakage)
+            # CRITICAL FIX: Drop rows with NaN patient IDs (prevents data leakage)
             # NaN can occur if Path format is unexpected - must not leak into multiple splits
             n_before = len(chexpert_df)
             chexpert_df = chexpert_df.dropna(subset=['Patient']).reset_index(drop=True)
@@ -1763,9 +1801,9 @@ def main():
         
         chexpert_train = CheXpertDataset('temp_chexpert_train.csv', CHEXPERT_ROOT, train_transform, SELECTED_LABELS, CHEXPERT_SAMPLE_SIZE)
         chexpert_valid = CheXpertDataset('temp_chexpert_val.csv', CHEXPERT_ROOT, val_transform, SELECTED_LABELS)
-        chexpert_test = CheXpertDataset('temp_chexpert_test.csv', CHEXPERT_ROOT, val_transform, SELECTED_LABELS)
+        # chexpert_test = CheXpertDataset('temp_chexpert_test.csv', CHEXPERT_ROOT, val_transform, SELECTED_LABELS)  # Not used in training
         
-        # ✅ SANITY CHECK: Verify CheXpert Cardiomegaly has enough certain samples for stable AUC
+        # SANITY CHECK: Verify CheXpert Cardiomegaly has enough certain samples for stable AUC
         print(f"\n{'='*70}")
         print("CHEXPERT VALIDATION CARDIOMEGALY SANITY CHECK")
         print(f"{'='*70}")
@@ -1784,15 +1822,15 @@ def main():
         print(f"  Uncertain (mask=0):   {total_samples - total_certain:6d} ({(total_samples - total_certain)/total_samples*100:.1f}%)")
         
         if total_certain < 100:
-            print("\n  ⚠️  WARNING: <100 certain samples! Cardiomegaly AUC will be unstable")
+            print("\n  WARNING: WARNING: <100 certain samples! Cardiomegaly AUC will be unstable")
             print("     Consider: NaN → mask=0 (treat as unknown) instead of NaN → 0 (certain negative)")
         elif pos_count < 20 or neg_count < 20:
-            print("\n  ⚠️  WARNING: <20 positives or negatives! AUC may be noisy")
+            print("\n  WARNING: WARNING: <20 positives or negatives! AUC may be noisy")
         else:
-            print("\n  ✅ Sufficient certain samples for stable AUC computation")
+            print("\n  Sufficient certain samples for stable AUC computation")
         print(f"{'='*70}\n")
         
-        # ✅ DIAGNOSTIC: Verify NaN handling is correct (NaN → supervised, -1 → masked)
+        # DIAGNOSTIC: Verify NaN handling is correct (NaN → supervised, -1 → masked)
         print(f"\n{'='*70}")
         print("CHEXPERT NaN/UNCERTAINTY MASKING DIAGNOSTIC")
         print(f"{'='*70}")
@@ -1828,7 +1866,7 @@ def main():
             print("   Strategy: Resample until all non-rare diseases have ≥20 positives in val/test")
             nih_df = pd.read_csv(NIH_CSV_PATH)
             
-            # ✅ CRITICAL FIX: Stratified split ensuring minimum positives per disease
+            # CRITICAL FIX: Stratified split ensuring minimum positives per disease
             # Prevents "N/A AUC" from weakening min_auc optimization
             nih_train_df, nih_val_df, nih_test_df = make_nih_patient_split_with_min_positives(
                 nih_df,
@@ -1846,7 +1884,7 @@ def main():
                 csv_name = NIH_NAME_MAP.get(disease, disease)
                 val_count = nih_val_df['Finding Labels'].str.contains(rf'(^|\|){csv_name}(\||$)', regex=True, na=False).sum()
                 test_count = nih_test_df['Finding Labels'].str.contains(rf'(^|\|){csv_name}(\||$)', regex=True, na=False).sum()
-                status = "✅" if (val_count >= 20 and test_count >= 20) or disease == 'Hernia' else "⚠️"
+                status = "PASS" if (val_count >= 20 and test_count >= 20) or disease == 'Hernia' else "LOW "
                 print(f"   {status} {disease:20s}: Val={val_count:4d}, Test={test_count:4d}")
             
             # Save fixed splits
@@ -1870,7 +1908,7 @@ def main():
         
         nih_train = NIHDataset('temp_nih_train.csv', NIH_IMAGE_DIR, train_transform, SELECTED_LABELS)
         nih_valid = NIHDataset('temp_nih_val.csv', NIH_IMAGE_DIR, val_transform, SELECTED_LABELS)
-        nih_test = NIHDataset('temp_nih_test.csv', NIH_IMAGE_DIR, val_transform, SELECTED_LABELS)
+        # nih_test = NIHDataset('temp_nih_test.csv', NIH_IMAGE_DIR, val_transform, SELECTED_LABELS)  # Not used in training
         
         # --- Pneumonia 70/15/15 Split (OPTIMIZED) ---
         pneumonia_fixed_train = os.path.join(CHECKPOINT_DIR, "pneumonia_fixed_train.csv")
@@ -1911,6 +1949,10 @@ def main():
             np.random.shuffle(normal_images)
             np.random.shuffle(pneumonia_images)
             
+            # Pneumonia uses 70/15/15 split (different from CheXpert/NIH 80/10/10)
+            # REASON: Small dataset (~5.8K images) benefits from larger validation/test sets
+            # ML BEST PRACTICE: Smaller datasets need proportionally more eval data for reliability
+            # With only ~5.8K images, 10% val/test would give insufficient samples per class
             # Split 70/15/15 for each class
             n_normal = len(normal_images)
             n_pneumonia = len(pneumonia_images)
@@ -1950,7 +1992,7 @@ def main():
         
         print(f"   Pneumonia - Train: {len(pneu_train_paths):,} | Val: {len(pneu_val_paths):,} | Test: {len(pneu_test_paths):,}")
         
-        # ✅ CONSOLIDATED: CSV-based Pneumonia dataset (shares logic with PneumoniaDataset above)
+        # CONSOLIDATED: CSV-based Pneumonia dataset (shares logic with PneumoniaDataset above)
         # Note: Main PneumoniaDataset (line ~1057) is for directory structure
         # This class is for CSV-based splits (more flexible for stratified sampling)
         class PneumoniaCSVDataset(Dataset):
@@ -1978,7 +2020,7 @@ def main():
                         labels[pneumonia_idx] = self.labels_list[idx]
                     
                     if self.return_masks:
-                        # ✅ CRITICAL FIX: Only Pneumonia disease is labeled
+                        # CRITICAL FIX: Only Pneumonia disease is labeled
                         mask = torch.zeros(len(SELECTED_LABELS), dtype=torch.float32)
                         if pneumonia_idx >= 0:
                             mask[pneumonia_idx] = 1.0  # Only Pneumonia is certain
@@ -2004,7 +2046,7 @@ def main():
         
         pneumonia_train = PneumoniaCSVDataset(pneu_train_df['image_path'].tolist(), pneu_train_df['label'].tolist(), train_transform)
         pneumonia_valid = PneumoniaCSVDataset(pneu_val_df['image_path'].tolist(), pneu_val_df['label'].tolist(), val_transform)
-        pneumonia_test = PneumoniaCSVDataset(pneu_test_df['image_path'].tolist(), pneu_test_df['label'].tolist(), val_transform)
+        # pneumonia_test = PneumoniaCSVDataset(pneu_test_df['image_path'].tolist(), pneu_test_df['label'].tolist(), val_transform)  # Not used in training
         
         print("\n" + "="*70)
         print("80/10/10 SPLITS CREATED & PERSISTED")
@@ -2103,7 +2145,24 @@ def main():
             persistent_workers=PERSISTENT_WORKERS
         )
         
-        # Use validation loaders: FULL NIH (avoid dropping rare positives), sampled CheXpert/Pneumonia
+        # ============================================================================
+        # VALIDATION SAMPLING STRATEGY
+        # ============================================================================
+        # RATIONALE: Different datasets require different validation approaches:
+        # # 1. CheXpert (179k train, ~20k val): SAMPLED to 1k-3k (4-13% of val set)
+        # - Large dataset, validation takes too long on full set
+        # - Stratified sampling ensures disease distribution preserved
+        # - Faster validation enables more frequent checkpointing
+        # # 2. NIH (89k train, ~10k val): FULL VALIDATION (100% of val set)
+        # - Contains rare diseases (e.g., Hernia: only 15 val samples!)
+        # - Sampling risks dropping ALL positives for rare classes
+        # - Critical for accurate rare disease performance measurement
+        # # 3. Pneumonia (4k train, ~0.5k val): SAMPLED to min(1k-3k, len(val))
+        # - Small dataset, sampling prevents overfitting to val set
+        # - Stratified sampling maintains Pneumonia/Normal balance
+        # # HARDWARE ADAPTATION: Sample size reduced on Intel Arc/DirectML (1k vs 3k)
+        # to accommodate memory constraints and slower validation speed.
+        # ============================================================================
         print("Creating validation loaders...")
         # Reduced validation samples for Intel Arc (faster validation)
         val_sample_size = 1000 if (IS_DIRECTML or str(DEVICE) == "xpu") else 3000
@@ -2151,7 +2210,7 @@ def main():
         criterion = MaskedSmoothedFocalLoss(
             alpha=FOCAL_ALPHA, 
             gamma=FOCAL_GAMMA, 
-            smoothing=FOCAL_SMOOTHING,  # ✅ Use config value (0.02)
+            smoothing=FOCAL_SMOOTHING,  # Use config value (0.02)
             class_weights=class_weights_tensor  # Apply class weights
         )
         optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
@@ -2296,12 +2355,7 @@ def main():
             }, emergency_checkpoint)
             
             # Rolling cleanup: keep only last 2 emergency checkpoints
-            old_emergency = os.path.join(CHECKPOINT_DIR, f"emergency_epoch_{epoch-2}.pt")
-            if os.path.exists(old_emergency):
-                try:
-                    os.remove(old_emergency)
-                except:
-                    pass
+            cleanup_emergency_checkpoints(keep_latest=2)
             
             # Validate every N epochs
             if epoch % VALIDATE_EVERY_N_EPOCHS == 0 or epoch == end_epoch:
@@ -2345,7 +2399,7 @@ def main():
                 
                 print(f"{'='*70}\n")
                 
-                # ✅ CRITICAL FIX: Weight mean AUC by number of valid classes per dataset
+                # CRITICAL FIX: Weight mean AUC by number of valid classes per dataset
                 # Prevents single-class Pneumonia from equally weighing with 14-class NIH
                 total_valid = max(1, nih_valid_k + chex_valid_k + pneu_valid_k)
                 mean_auc = (nih_auc * nih_valid_k + chexpert_auc * chex_valid_k + pneumonia_auc * pneu_valid_k) / total_valid
@@ -2497,14 +2551,7 @@ def main():
                     print(f"   Pneumonia (Pneumonia):          {pneu_pneu_auc:.4f}")
                     
                     # Clean up ALL emergency checkpoints after successful best model save
-                    try:
-                        emergency_files = [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith('emergency_epoch_')]
-                        for file in emergency_files:
-                            os.remove(os.path.join(CHECKPOINT_DIR, file))
-                        if emergency_files:
-                            print(f"Cleaned up {len(emergency_files)} emergency checkpoint(s)")
-                    except Exception as e:
-                        print(f"Warning: Emergency checkpoint cleanup failed: {e}")
+                    cleanup_emergency_checkpoints(keep_latest=0)
                 else:
                     patience_counter += 1
                     print(f"\nNo improvement. Patience: {patience_counter}/{EARLY_STOPPING_PATIENCE}")
