@@ -199,18 +199,20 @@ FOCAL_SMOOTHING = 0.02  # Better for medical/noisy labels (was hardcoded 0.05)
 CHEXPERT_NAN_IS_UNKNOWN = True  # Try True first for best Cardiomegaly AUC
 
 # Paths
-CHEXPERT_ROOT = r"C:\Users\MohdZaminQuadri\Downloads\Medico-Xray\datasets\chexpert"
+# Configure these locations with environment variables instead of editing the script.
+# The default layout is documented in README.md and deliberately contains no user path.
+DATA_DIR = os.environ.get("MEDICO_DATA_DIR", "data")
+CHEXPERT_ROOT = os.environ.get("CHEXPERT_ROOT", os.path.join(DATA_DIR, "chexpert"))
 CHEXPERT_TRAIN_CSV = os.path.join(CHEXPERT_ROOT, "train.csv")  # Will be split 80/10/10
 # Note: Original valid.csv not used - we create our own patient-level splits
 
-NIH_IMAGE_DIR = r"C:\Users\MohdZaminQuadri\Downloads\Medico-Xray\datasets\nih\images\images"
-# Fixed: CSV file is inside Data_Entry_2017.csv directory (directory name, not file!)
-NIH_CSV_PATH = r"C:\Users\MohdZaminQuadri\Downloads\Medico-Xray\datasets\nih\Data_Entry_2017.csv\Data_Entry_2017.csv"
+NIH_IMAGE_DIR = os.environ.get("NIH_IMAGE_DIR", os.path.join(DATA_DIR, "nih", "images", "images"))
+NIH_CSV_PATH = os.environ.get("NIH_CSV_PATH", os.path.join(DATA_DIR, "nih", "Data_Entry_2017.csv"))
 
-PNEUMONIA_ROOT = r"C:\Users\MohdZaminQuadri\Downloads\Medico-Xray\datasets\pneumonia"
+PNEUMONIA_ROOT = os.environ.get("PNEUMONIA_ROOT", os.path.join(DATA_DIR, "pneumonia"))
 
-PHASE3_DIR = "checkpoints_phase3_fulldata"
-CHECKPOINT_DIR = "checkpoints_phase4_masked"
+PHASE3_DIR = os.environ.get("PHASE3_DIR", "checkpoints_phase3_fulldata")
+CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "checkpoints_phase4_masked")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 LOG_FILE = os.path.join(CHECKPOINT_DIR, 'training_log.txt')
@@ -254,7 +256,7 @@ if str(DEVICE) == "cuda":
 # UTILITY FUNCTIONS
 # ============================================================================
 def validate_paths():
-    """Validate all required dataset paths exist"""
+    """Validate all required dataset and resume-checkpoint paths exist."""
     critical_paths = [
         CHEXPERT_TRAIN_CSV,
         # CHEXPERT_VALID_CSV removed - not used in Phase 4 (we create our own splits)
@@ -266,7 +268,12 @@ def validate_paths():
     for path in critical_paths:
         if not os.path.exists(path):
             print(f"ERROR: Required path not found: {path}")
+            print("Set the corresponding environment variable; see README.md for the expected layout.")
             sys.exit(1)
+    if RESUME_FROM_BEST and not os.path.isfile(BEST_CHECKPOINT):
+        print(f"ERROR: Required Phase 3 checkpoint not found: {BEST_CHECKPOINT}")
+        print("Set PHASE3_DIR or set RESUME_FROM_BEST = False only when intentionally starting without it.")
+        sys.exit(1)
     print("All dataset paths validated\n")
 
 def print_memory_info():

@@ -1,0 +1,10 @@
+# Local data and derived medical-data artifacts
+data/
+checkpoints_phase3_fulldata/
+checkpoints_phase4_masked/
+temp_*.csv
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
