@@ -1,9 +1,11 @@
 # The scientific stack is pinned, because these versions decide how the data is
-# parsed and split.
+# parsed and split. Pins are taken from installed distribution metadata and the
+# set is resolved as a whole: opencv-python 4.12 caps numpy below 2.3, which
+# silently conflicts with the numpy pin here.
 numpy==2.4.3
 pandas==2.3.3
 Pillow==12.1.1
-opencv-python==4.12.0.88
+opencv-python==4.13.0.92
 psutil==7.2.2
 scikit-learn==1.8.0
 tqdm==4.67.3
