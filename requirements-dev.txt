@@ -1,0 +1,4 @@
+-r requirements.txt
+matplotlib==3.10.8
+pytest==9.0.2
+ruff==0.16.1

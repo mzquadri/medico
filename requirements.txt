@@ -1,9 +1,16 @@
-numpy
-pandas
-Pillow
-opencv-python
-scikit-learn
-torch
-torchvision
-tqdm
-psutil
+# The scientific stack is pinned, because these versions decide how the data is
+# parsed and split.
+numpy==2.4.3
+pandas==2.3.3
+Pillow==12.1.1
+opencv-python==4.13.0.88
+psutil==7.2.2
+scikit-learn==1.8.0
+tqdm==4.67.3
+
+# torch and torchvision are deliberately not pinned to an exact build. The script
+# runs on Intel XPU, DirectML, CUDA or CPU, and each of those needs a different
+# wheel from a different index. Install the build that matches your accelerator,
+# then these bounds apply. Development here used 2.11.0+xpu and 0.26.0+xpu.
+torch>=2.1
+torchvision>=0.16
