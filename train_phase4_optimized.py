@@ -33,6 +33,13 @@ from PIL import Image
 import cv2
 from tqdm import tqdm
 
+from medico.splits import (
+    SplitSizes,
+    grouped_stratified_split,
+    overlap,
+    pneumonia_group_key,
+)
+
 warnings.filterwarnings('ignore')
 
 import torch
@@ -150,7 +157,20 @@ SELECTED_LABELS = [
     "Pneumonia",
     "Pneumothorax"
 ]
-LABEL_TO_IDX = {label: idx for idx, label in enumerate(SELECTED_LABELS)}  # Safe label indexing
+LABEL_TO_IDX = {label: idx for idx, label in enumerate(SELECTED_LABELS)}
+
+#: The CheXpert columns that correspond to a finding in SELECTED_LABELS. Every
+#: finding not named here is unsupported by CheXpert and is masked out of the
+#: loss for those rows rather than treated as a confident negative.
+CHEXPERT_TO_NIH = {
+    'Atelectasis': 'Atelectasis',
+    'Cardiomegaly': 'Cardiomegaly',
+    'Consolidation': 'Consolidation',
+    'Edema': 'Edema',
+    'Pleural Effusion': 'Effusion',   # CheXpert spells it out, NIH abbreviates
+    'Pneumonia': 'Pneumonia',
+    'Pneumothorax': 'Pneumothorax',
+}  # Safe label indexing
 
 # FINE-TUNING HYPERPARAMETERS (optimized for Phase 4 + Intel Arc 2GB VRAM)
 IMG_SIZE = 224               # Reduced from 320 for 2GB VRAM (saves 51% memory)
@@ -1005,17 +1025,9 @@ class CheXpertDataset(Dataset):
         self.fallback_count = 0  # Track missing images for debugging
         self.return_masks = return_masks
         
-        # CheXpert → NIH disease name mapping
-        # CheXpert diseases that match NIH (we'll use these)
-        chexpert_to_nih = {
-            'Atelectasis': 'Atelectasis',
-            'Cardiomegaly': 'Cardiomegaly',
-            'Consolidation': 'Consolidation',
-            'Edema': 'Edema',
-            'Pleural Effusion': 'Effusion',  # CheXpert uses full name, NIH uses short
-            'Pneumonia': 'Pneumonia',
-            'Pneumothorax': 'Pneumothorax'
-        }
+        # Module-level constant, so the coverage it defines can be inspected and
+        # drawn without instantiating a dataset.
+        chexpert_to_nih = CHEXPERT_TO_NIH
         
         # Initialize labels and masks for all 14 diseases
         num_samples = len(self.df)
@@ -1944,6 +1956,14 @@ def main():
             chexpert_train_df = chexpert_df[chexpert_df['Patient'].isin(train_patients)].copy()
             chexpert_val_df = chexpert_df[chexpert_df['Patient'].isin(val_patients)].copy()
             chexpert_test_df = chexpert_df[chexpert_df['Patient'].isin(test_patients)].copy()
+
+            _leak = overlap(chexpert_train_df, chexpert_val_df, chexpert_test_df,
+                            key='Patient')
+            if _leak:
+                raise RuntimeError(
+                    f'Patient leakage in the CheXpert split: {len(_leak)} patients '
+                    f'appear in more than one split')
+            print('   Verified: no patient appears in more than one CheXpert split')
             
             # Save fixed splits
             chexpert_train_df.to_csv(chexpert_fixed_train, index=False)
@@ -2038,6 +2058,13 @@ def main():
                 max_tries=50,   # Attempt limit (usually finds valid split in <10 tries)
                 seed=42
             )
+
+            _leak = overlap(nih_train_df, nih_val_df, nih_test_df, key='Patient ID')
+            if _leak:
+                raise RuntimeError(
+                    f'Patient leakage in the NIH split: {len(_leak)} patients '
+                    f'appear in more than one split')
+            print('   Verified: no patient appears in more than one NIH split')
             
             # Verify final counts
             print(f"\n   Final disease counts (Val / Test):")
@@ -2084,8 +2111,9 @@ def main():
             pneu_val_paths = pd.read_csv(pneumonia_fixed_val)['image_path'].tolist()
             pneu_test_paths = pd.read_csv(pneumonia_fixed_test)['image_path'].tolist()
         else:
-            print(f"\n[NEW] Creating NEW Pneumonia 70/15/15 splits (stratified)...")
-            print("   Strategy: Larger val/test (15% each) for small imbalanced dataset")
+            print(f"\n[NEW] Creating NEW Pneumonia 70/15/15 splits (patient-grouped)...")
+            print("   Grouping by the person id carried in the filename, so that no")
+            print("   patient can appear in more than one split.")
             # Collect all images from train + test folders
             all_images = []
             for split_name in ['train', 'test']:
@@ -2098,51 +2126,35 @@ def main():
                                 img_path = os.path.join(class_dir, img_name)
                                 label = 1.0 if class_name == 'PNEUMONIA' else 0.0
                                 all_images.append({'image_path': img_path, 'label': label})
-            
-            # Stratified shuffle and split 70/15/15 (class-balanced)
-            # Separate by class for stratified sampling
+
             normal_images = [x for x in all_images if x['label'] == 0.0]
             pneumonia_images = [x for x in all_images if x['label'] == 1.0]
-            
             print(f"   Total: {len(all_images)} images (NORMAL: {len(normal_images)}, PNEUMONIA: {len(pneumonia_images)})")
-            print(f"   Class ratio: {len(pneumonia_images)/len(normal_images):.2f}:1 (PNEUMONIA:NORMAL)")
-            
-            # Shuffle both classes
-            np.random.seed(42)
-            np.random.shuffle(normal_images)
-            np.random.shuffle(pneumonia_images)
-            
-            # Pneumonia uses 70/15/15 split (different from CheXpert/NIH 80/10/10)
-            # REASON: Small dataset (~5.8K images) benefits from larger validation/test sets
-            # ML BEST PRACTICE: Smaller datasets need proportionally more eval data for reliability
-            # With only ~5.8K images, 10% val/test would give insufficient samples per class
-            # Split 70/15/15 for each class
-            n_normal = len(normal_images)
-            n_pneumonia = len(pneumonia_images)
-            
-            train_end_normal = int(0.70 * n_normal)
-            val_end_normal = int(0.85 * n_normal)
-            train_end_pneumonia = int(0.70 * n_pneumonia)
-            val_end_pneumonia = int(0.85 * n_pneumonia)
-            
-            # Combine stratified splits
-            pneu_train_list = normal_images[:train_end_normal] + pneumonia_images[:train_end_pneumonia]
-            pneu_val_list = normal_images[train_end_normal:val_end_normal] + pneumonia_images[train_end_pneumonia:val_end_pneumonia]
-            pneu_test_list = normal_images[val_end_normal:] + pneumonia_images[val_end_pneumonia:]
-            
-            # Shuffle combined lists
-            np.random.shuffle(pneu_train_list)
-            np.random.shuffle(pneu_val_list)
-            np.random.shuffle(pneu_test_list)
-            
-            # Print stratified counts
+            if normal_images:
+                print(f"   Class ratio: {len(pneumonia_images)/len(normal_images):.2f}:1 (PNEUMONIA:NORMAL)")
+
+            n_groups = len({pneumonia_group_key(x['image_path']) for x in all_images})
+            print(f"   Distinct patients recovered from filenames: {n_groups}")
+
+            pneu_train_list, pneu_val_list, pneu_test_list = grouped_stratified_split(
+                all_images, SplitSizes(0.70, 0.15, 0.15), seed=42)
+
+            # A leak here would silently inflate every score reported afterwards.
+            leaked = overlap(pneu_train_list, pneu_val_list, pneu_test_list,
+                             key=lambda r: pneumonia_group_key(r['image_path']))
+            if leaked:
+                raise RuntimeError(
+                    f"Patient leakage in the pneumonia split: {len(leaked)} patients "
+                    f"appear in more than one split")
+            print("   Verified: no patient appears in more than one split")
+
             train_normal = sum(1 for x in pneu_train_list if x['label'] == 0.0)
             val_normal = sum(1 for x in pneu_val_list if x['label'] == 0.0)
             test_normal = sum(1 for x in pneu_test_list if x['label'] == 0.0)
             print(f"   Train: {len(pneu_train_list)} (NORMAL: {train_normal}, PNEUMONIA: {len(pneu_train_list)-train_normal})")
             print(f"   Val:   {len(pneu_val_list)} (NORMAL: {val_normal}, PNEUMONIA: {len(pneu_val_list)-val_normal})")
             print(f"   Test:  {len(pneu_test_list)} (NORMAL: {test_normal}, PNEUMONIA: {len(pneu_test_list)-test_normal})")
-            
+
             # Save as CSV
             pd.DataFrame(pneu_train_list).to_csv(pneumonia_fixed_train, index=False)
             pd.DataFrame(pneu_val_list).to_csv(pneumonia_fixed_val, index=False)
@@ -2465,11 +2477,13 @@ def main():
         # Load existing log if resuming
         if os.path.exists(DETAILED_LOG_FILE) and RESUME_FROM_BEST:
             try:
-                with open(DETAILED_LOG_FILE, 'r') as f:
+                with open(DETAILED_LOG_FILE) as f:
                     detailed_log = json.load(f)
                 print(f"Loaded existing detailed log with {len(detailed_log['epochs'])} epochs")
-            except:
-                print("Could not load existing log, creating new one")
+            except (OSError, ValueError, KeyError) as exc:
+                # Deliberately narrow. A bare except here would also swallow a
+                # KeyboardInterrupt during a run that takes hours.
+                print(f"Could not load existing log ({type(exc).__name__}), creating new one")
         
         # Validate training setup
         if not validate_training_setup(model, train_loader, criterion, optimizer):
