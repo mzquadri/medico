@@ -4,7 +4,7 @@
 # silently conflicts with the numpy pin here.
 numpy==2.4.3
 pandas==2.3.3
-Pillow==12.1.1
+Pillow==12.3.0
 opencv-python==4.13.0.92
 psutil==7.2.2
 scikit-learn==1.8.0

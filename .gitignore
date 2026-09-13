@@ -1,8 +1,20 @@
-# Local data and derived medical-data artifacts
+# Local data and derived medical-data artifacts.
+#
+# The two checkpoint directories below are the defaults, but CHECKPOINT_DIR is an
+# environment variable and can point anywhere, including inside this repository. The
+# artifacts it receives are model weights and the split CSVs, and those CSVs carry a
+# Patient ID column and image paths. Missing one of them is not a tidiness problem in a
+# medical repository, so the patterns below are by shape as well as by location.
 data/
-checkpoints_phase3_fulldata/
-checkpoints_phase4_masked/
+checkpoints*/
+logs/
 temp_*.csv
+*_fixed_train.csv
+*_fixed_val.csv
+*_fixed_test.csv
+*.pt
+*.pth
+*.ckpt
 
 # Python environments and caches
 .venv/
