@@ -35,7 +35,10 @@ from tqdm import tqdm
 
 from medico.splits import (
     SplitSizes,
+    count_positive,
     grouped_stratified_split,
+    label_matches,
+    nih_patient_split_with_min_positives,
     overlap,
     pneumonia_group_key,
 )
@@ -596,72 +599,6 @@ def validate_training_setup(model, train_loader, criterion, optimizer):
         print(f"ERROR: Training setup validation failed: {e}")
         return False
 
-def make_nih_patient_split_with_min_positives(nih_df, diseases, min_pos=20, max_tries=50, seed=42):
-    """
-    Create patient-level 80/10/10 split ensuring each disease has minimum positives in val/test.
-    
-    This prevents "single-class AUC = N/A" which would weaken min_auc optimization.
-    
-    Args:
-        nih_df: NIH DataFrame with 'Patient ID' and 'Finding Labels'
-        diseases: List of disease names to check
-        min_pos: Minimum positive samples per disease in val/test (default: 20)
-        max_tries: Maximum attempts to find valid split (default: 50)
-        seed: Random seed for reproducibility
-        
-    Returns:
-        tuple: (train_df, val_df, test_df) with guaranteed min positives
-    """
-    rng = np.random.RandomState(seed)
-    patients = nih_df['Patient ID'].unique()
-    
-    # Mapping for diseases with spaces in CSV (NIH uses "Pleural Thickening" not "Pleural_Thickening")
-    NIH_NAME_MAP = {
-        "Pleural_Thickening": "Pleural Thickening"
-    }
-    
-    def count_pos(df_part, disease):
-        """Count positive samples for disease in dataframe partition"""
-        csv_name = NIH_NAME_MAP.get(disease, disease)
-        return df_part['Finding Labels'].str.contains(rf'(^|\|){csv_name}(\||$)', regex=True, na=False).sum()
-    
-    for attempt in range(max_tries):
-        # Shuffle patients
-        rng.shuffle(patients)
-        n = len(patients)
-        tr_end, va_end = int(0.8 * n), int(0.9 * n)
-        
-        tr_p = set(patients[:tr_end])
-        va_p = set(patients[tr_end:va_end])
-        te_p = set(patients[va_end:])
-        
-        # Create splits
-        tr = nih_df[nih_df['Patient ID'].isin(tr_p)].copy()
-        va = nih_df[nih_df['Patient ID'].isin(va_p)].copy()
-        te = nih_df[nih_df['Patient ID'].isin(te_p)].copy()
-        
-        # Check if all non-rare diseases meet minimum
-        ok = True
-        for disease in diseases:
-            if disease == 'Hernia':  # Rare disease - skip minimum check
-                continue
-            
-            va_pos = count_pos(va, disease)
-            te_pos = count_pos(te, disease)
-            
-            if va_pos < min_pos or te_pos < min_pos:
-                ok = False
-                break
-        
-        if ok:
-            print(f"   Found valid split on attempt {attempt + 1}/{max_tries}")
-            return tr, va, te
-    
-    # Fallback: return last split if constraints can't be met
-    print(f"   WARNING: Could not meet min_pos={min_pos} constraint in {max_tries} tries")
-    print(f"   Using best-effort split (may have single-class AUCs)")
-    return tr, va, te
-
 def cleanup_temp_files():
     """Clean up temporary files and old checkpoints"""
     print("\nCleaning up temporary files...")
@@ -1165,19 +1102,13 @@ class NIHDataset(Dataset):
         self.df['Finding Labels'] = self.df['Finding Labels'].fillna('')
         self.labels = np.zeros((len(self.df), len(self.selected_labels)), dtype=np.float32)
         
-        def has(lbl):
-            # Exact match in pipe-separated list
-            return self.df['Finding Labels'].str.contains(rf'(^|\|){lbl}(\||$)', regex=True)
-        
-        # CRITICAL: NIH CSV uses "Pleural Thickening" (space) not "Pleural_Thickening" (underscore)
-        NIH_NAME_MAP = {
-            "Pleural_Thickening": "Pleural Thickening"  # CSV has space, internal code uses underscore
-        }
-        
-        # Map all 14 NIH diseases with name correction
+        # One rule for "does this pipe-separated list contain this finding", shared with
+        # medico.splits so the counts used to build a split and the labels used to train
+        # on it cannot diverge. It also handles the NIH spelling, "Pleural Thickening"
+        # with a space against the underscored name used internally.
         for disease in self.selected_labels:
-            csv_name = NIH_NAME_MAP.get(disease, disease)  # Use mapped name if exists
-            self.labels[:, LABEL_TO_IDX[disease]] = has(csv_name).astype(np.float32).values
+            matched = label_matches(self.df['Finding Labels'], disease)
+            self.labels[:, LABEL_TO_IDX[disease]] = matched.astype(np.float32).values
     
     def __len__(self):
         return len(self.df)
@@ -2051,13 +1982,27 @@ def main():
             
             # CRITICAL FIX: Stratified split ensuring minimum positives per disease
             # Prevents "N/A AUC" from weakening min_auc optimization
-            nih_train_df, nih_val_df, nih_test_df = make_nih_patient_split_with_min_positives(
+            # medico.splits owns this, and is the version the tests exercise. The copy
+            # that used to live in this file returned three values and only printed a
+            # warning when it gave up, so a fallback split was indistinguishable from a
+            # successful one to everything downstream. This one reports what it achieved.
+            nih_train_df, nih_val_df, nih_test_df, split_info = nih_patient_split_with_min_positives(
                 nih_df,
                 diseases=SELECTED_LABELS,
                 min_pos=20,     # Minimum positives in val/test for stable AUC
                 max_tries=50,   # Attempt limit (usually finds valid split in <10 tries)
-                seed=42
+                seed=42,
             )
+            if split_info["met_minimum"]:
+                print(f"   Found a valid split on attempt {split_info['attempts']}/50")
+            else:
+                # Not fatal: a subset of NIH may genuinely lack 20 positives for a rare
+                # finding. It must be visible, because an AUC computed on a handful of
+                # positives swings on single images.
+                print(f"   WARNING: after {split_info['attempts']} attempts these findings "
+                      f"still hold fewer than {split_info['min_pos']} positives in "
+                      f"validation or test: {', '.join(split_info['short'])}")
+                print("   Their AUCs will be unstable. The split is used as-is.")
 
             _leak = overlap(nih_train_df, nih_val_df, nih_test_df, key='Patient ID')
             if _leak:
@@ -2069,11 +2014,9 @@ def main():
             # Verify final counts
             print(f"\n   Final disease counts (Val / Test):")
             for disease in SELECTED_LABELS:
-                # Use same mapping as helper function
-                NIH_NAME_MAP = {"Pleural_Thickening": "Pleural Thickening"}
-                csv_name = NIH_NAME_MAP.get(disease, disease)
-                val_count = nih_val_df['Finding Labels'].str.contains(rf'(^|\|){csv_name}(\||$)', regex=True, na=False).sum()
-                test_count = nih_test_df['Finding Labels'].str.contains(rf'(^|\|){csv_name}(\||$)', regex=True, na=False).sum()
+                # count_positive applies the same matching rule as the label matrix.
+                val_count = count_positive(nih_val_df, disease)
+                test_count = count_positive(nih_test_df, disease)
                 status = "PASS" if (val_count >= 20 and test_count >= 20) or disease == 'Hernia' else "LOW "
                 print(f"   {status} {disease:20s}: Val={val_count:4d}, Test={test_count:4d}")
             
@@ -2438,7 +2381,7 @@ def main():
         if pt_count < 100:
             print("CRITICAL ERROR: Pleural_Thickening has <100 samples!")
             print("                NIH CSV uses 'Pleural Thickening' (space) not underscore")
-            print("                Check NIH_NAME_MAP in NIHDataset.__init__")
+            print("                Check NIH_NAME_MAP in medico/splits.py")
         print(f"{'='*70}\n")
         
         # Truncate log file to avoid appending across runs

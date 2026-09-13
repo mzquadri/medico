@@ -137,13 +137,36 @@ def patient_split(frame, patient_column: str, sizes: SplitSizes, seed: int = 42)
     )
 
 
+def label_matches(labels, disease: str):
+    """Boolean mask: which rows of an NIH-style `Finding Labels` column carry `disease`.
+
+    The column is a pipe-separated list, so a finding is present only as a whole
+    element. "Mass" must not match "Mass Effect", which anchoring on the pipes and
+    the ends achieves.
+
+    Three details that are easy to get wrong, and were:
+
+    - Non-capturing groups. pandas warns that a pattern with match groups is
+      probably meant for `str.extract`; the boundaries here are only anchors, and
+      the capturing form emitted one warning per finding on every dataset load.
+    - `re.escape`. The finding name is interpolated into a regex. None of the
+      fourteen NIH names contains a metacharacter today, so nothing is currently
+      mislabelled, but an unescaped name that did would silently fail to match the
+      row it belongs to rather than raise.
+    - `na=False`. A missing cell is not a match, and without this the result is a
+      three-valued mask that turns into a surprise wherever it is used as a bool.
+
+    This lives here because the training script needs exactly the same rule, and
+    keeping two copies of it is how the two drift apart.
+    """
+    csv_name = NIH_NAME_MAP.get(disease, disease)
+    pattern = rf"(?:^|\|){re.escape(csv_name)}(?:\||$)"
+    return labels.str.contains(pattern, regex=True, na=False)
+
+
 def count_positive(frame, disease: str) -> int:
     """Positive rows for one finding in an NIH-style `Finding Labels` column."""
-    csv_name = NIH_NAME_MAP.get(disease, disease)
-    # Non-capturing groups: pandas warns that a pattern with match groups is
-    # probably meant for str.extract, and the boundaries here are only anchors.
-    pattern = rf"(?:^|\|){re.escape(csv_name)}(?:\||$)"
-    return int(frame["Finding Labels"].str.contains(pattern, regex=True, na=False).sum())
+    return int(label_matches(frame["Finding Labels"], disease).sum())
 
 
 def nih_patient_split_with_min_positives(nih_df, diseases, min_pos: int = 20,
