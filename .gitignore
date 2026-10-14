@@ -4,6 +4,15 @@ checkpoints_phase3_fulldata/
 checkpoints_phase4_masked/
 temp_*.csv
 
+# ai-radiologist: model weights and image corpora are redistributed by their
+# owners, not from here. The weights are a 28 MB TorchXRayVision checkpoint that
+# the loader fetches on demand; demo_images holds NIH ChestX-ray14 radiographs,
+# which NIH distributes under its own terms.
+ai-radiologist/models/
+ai-radiologist/demo_images/
+ai-radiologist/results/
+ai-radiologist/eval/scores.json
+
 # Python environments and caches
 .venv/
 __pycache__/

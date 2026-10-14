@@ -2,6 +2,33 @@
 
 This repository contains a research training script for Phase 4 fine-tuning of a DenseNet-121 chest X-ray classifier across 14 findings. It combines CheXpert, NIH ChestX-ray14, and a binary pneumonia dataset, with masked focal loss for uncertain or unavailable labels.
 
+## Two components, two different models
+
+Read this before comparing any numbers between them.
+
+| | `train_phase4_optimized.py` | [`ai-radiologist/`](ai-radiologist/) |
+| --- | --- | --- |
+| What it is | The fine-tuning job | A screening and explainability demo |
+| Model | DenseNet-121 fine-tuned here, from a Phase 3 checkpoint | DenseNet-121 **pre-trained by [TorchXRayVision](https://github.com/mlmed/torchxrayvision)**, used as shipped |
+| Findings | 14 | 5 |
+| Weights | Not tracked; produced by running the script | Not tracked; fetched by the loader |
+
+They share an architecture and a problem, not a checkpoint. The demo was built to exercise
+the inference, attribution and reporting path end to end, and it runs on public pre-trained
+weights so it works without the training artefacts. Accuracy figures from one say nothing
+about the other.
+
+## Datasets
+
+Obtain each from its owner and comply with its licence and access terms. None are
+redistributed here.
+
+| Dataset | Content | Source |
+| --- | --- | --- |
+| **NIH ChestX-ray14** | 112,120 frontal radiographs, 30,805 patients, 14 findings; labels in `Data_Entry_2017.csv` | [NIH Clinical Center](https://nihcc.app.box.com/v/ChestXray-NIHCC) · [paper](https://arxiv.org/abs/1705.02315) · [Kaggle mirror](https://www.kaggle.com/datasets/nih-chest-xrays/data) |
+| **CheXpert** | 224,316 radiographs, 65,240 patients, 14 observations with explicit uncertainty labels | [Stanford AIMI](https://stanfordmlgroup.github.io/competitions/chexpert/) · [paper](https://arxiv.org/abs/1901.07031) |
+| **Chest X-Ray Pneumonia** | Binary pneumonia / normal paediatric set | [Kaggle](https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia) |
+
 ## Status and scope
 
 This is experimental research code, not a clinical product. No trained weights, patient data, held-out metrics, or clinical validation are included in this repository. The implementation must not be used for diagnosis, triage, treatment decisions, or any other clinical purpose.
