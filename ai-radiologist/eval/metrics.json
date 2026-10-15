@@ -1,0 +1,132 @@
+{
+ "model": "densenet121-res224-all",
+ "ground_truth": "NIH ChestX-ray14 Data_Entry_2017.csv",
+ "n_images": 4128,
+ "findings": [
+  {
+   "finding": "Atelectasis",
+   "n_positive": 441,
+   "n_negative": 3687,
+   "prevalence": 0.1068313953488372,
+   "auroc": 0.8335805708233931,
+   "auprc": 0.3191404321983738,
+   "auprc_random_baseline": 0.1068313953488372,
+   "score_range_negative": [
+    0.500144,
+    0.681412
+   ],
+   "score_range_positive": [
+    0.520627,
+    0.69037
+   ],
+   "shipped_threshold": 0.58,
+   "shipped_sensitivity": 0.981859410430839,
+   "shipped_specificity": 0.5576349335503119,
+   "shipped_youden_j": 0.539494343981151,
+   "youden_threshold": 0.583496,
+   "youden_j": 0.5441807859569106,
+   "youden_sensitivity": 0.9773242630385488,
+   "youden_specificity": 0.5668565229183619
+  },
+  {
+   "finding": "Cardiomegaly",
+   "n_positive": 123,
+   "n_negative": 4005,
+   "prevalence": 0.029796511627906978,
+   "auroc": 0.9070612953320545,
+   "auprc": 0.27270071937511287,
+   "auprc_random_baseline": 0.029796511627906978,
+   "score_range_negative": [
+    0.500019,
+    0.720668
+   ],
+   "score_range_positive": [
+    0.503489,
+    0.692592
+   ],
+   "shipped_threshold": 0.55,
+   "shipped_sensitivity": 0.9105691056910569,
+   "shipped_specificity": 0.7852684144818977,
+   "shipped_youden_j": 0.6958375201729545,
+   "youden_threshold": 0.550626,
+   "youden_j": 0.6985840869644651,
+   "youden_sensitivity": 0.9105691056910569,
+   "youden_specificity": 0.7880149812734082
+  },
+  {
+   "finding": "Consolidation",
+   "n_positive": 204,
+   "n_negative": 3924,
+   "prevalence": 0.04941860465116279,
+   "auroc": 0.852692580600028,
+   "auprc": 0.16516688860517115,
+   "auprc_random_baseline": 0.04941860465116279,
+   "score_range_negative": [
+    0.502713,
+    0.677911
+   ],
+   "score_range_positive": [
+    0.523568,
+    0.676144
+   ],
+   "shipped_threshold": 0.6,
+   "shipped_sensitivity": 0.9607843137254902,
+   "shipped_specificity": 0.6373598369011213,
+   "shipped_youden_j": 0.5981441506266116,
+   "youden_threshold": 0.604467,
+   "youden_j": 0.603495832583798,
+   "youden_sensitivity": 0.9607843137254902,
+   "youden_specificity": 0.6427115188583078
+  },
+  {
+   "finding": "Edema",
+   "n_positive": 107,
+   "n_negative": 4021,
+   "prevalence": 0.025920542635658916,
+   "auroc": 0.8864291906741941,
+   "auprc": 0.12681970501704076,
+   "auprc_random_baseline": 0.025920542635658916,
+   "score_range_negative": [
+    0.5,
+    0.669873
+   ],
+   "score_range_positive": [
+    0.501471,
+    0.644927
+   ],
+   "shipped_threshold": 0.52,
+   "shipped_sensitivity": 0.9719626168224299,
+   "shipped_specificity": 0.7097736881372793,
+   "shipped_youden_j": 0.6817363049597092,
+   "youden_threshold": 0.521647,
+   "youden_j": 0.6936736339823404,
+   "youden_sensitivity": 0.9719626168224299,
+   "youden_specificity": 0.7217110171599105
+  },
+  {
+   "finding": "Effusion",
+   "n_positive": 547,
+   "n_negative": 3581,
+   "prevalence": 0.13250968992248063,
+   "auroc": 0.9094867437169665,
+   "auprc": 0.5540318957009626,
+   "auprc_random_baseline": 0.13250968992248063,
+   "score_range_negative": [
+    0.500457,
+    0.722463
+   ],
+   "score_range_positive": [
+    0.505371,
+    0.726963
+   ],
+   "shipped_threshold": 0.61,
+   "shipped_sensitivity": 0.9341864716636198,
+   "shipped_specificity": 0.7852555152192126,
+   "shipped_youden_j": 0.7194419868828323,
+   "youden_threshold": 0.615225,
+   "youden_j": 0.7233515093625864,
+   "youden_sensitivity": 0.9341864716636198,
+   "youden_specificity": 0.7891650376989667
+  }
+ ]
+}
