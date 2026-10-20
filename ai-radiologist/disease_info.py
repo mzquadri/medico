@@ -59,7 +59,7 @@ DISEASE_INFO = {
         "clinical_significance": "Moderate to High",
         "urgency": "Variable - depends on extent and underlying cause"
     },
-    
+
     "Cardiomegaly": {
         "full_name": "Cardiomegaly (Enlarged Heart)",
         "description": (
@@ -111,7 +111,7 @@ DISEASE_INFO = {
         "clinical_significance": "High",
         "urgency": "Requires cardiovascular evaluation"
     },
-    
+
     "Consolidation": {
         "full_name": "Pulmonary Consolidation",
         "description": (
@@ -165,7 +165,7 @@ DISEASE_INFO = {
         "clinical_significance": "High",
         "urgency": "Prompt evaluation required"
     },
-    
+
     "Edema": {
         "full_name": "Pulmonary Edema",
         "description": (
@@ -221,7 +221,7 @@ DISEASE_INFO = {
         "clinical_significance": "High",
         "urgency": "Urgent - may require immediate intervention"
     },
-    
+
     "Effusion": {
         "full_name": "Pleural Effusion",
         "description": (
@@ -284,10 +284,10 @@ DISEASE_INFO = {
 def get_disease_info(disease_name: str) -> dict:
     """
     Retrieve information about a specific disease.
-    
+
     Args:
         disease_name: Name of the disease
-        
+
     Returns:
         Dictionary containing disease information
     """
@@ -295,41 +295,41 @@ def get_disease_info(disease_name: str) -> dict:
     for key in DISEASE_INFO:
         if key.lower() == disease_name.lower():
             return DISEASE_INFO[key]
-    
+
     return None
 
 
 def get_disease_summary(disease_name: str) -> str:
     """
     Get a brief summary of disease information.
-    
+
     Args:
         disease_name: Name of the disease
-        
+
     Returns:
         Formatted summary string
     """
     info = get_disease_info(disease_name)
-    
+
     if info is None:
         return f"No information available for {disease_name}"
-    
+
     summary = []
     summary.append(f"\n{info['full_name']}")
     summary.append("=" * len(info['full_name']))
     summary.append(f"\n{info['description']}")
-    
+
     summary.append("\n\nPrimary Causes:")
     for cause in info['causes'][:5]:
         summary.append(f"  - {cause}")
-    
+
     summary.append("\n\nKey Precautions:")
     for precaution in info['precautions'][:5]:
         summary.append(f"  - {precaution}")
-    
+
     summary.append(f"\n\nClinical Significance: {info['clinical_significance']}")
     summary.append(f"Urgency Level: {info['urgency']}")
-    
+
     return "\n".join(summary)
 
 
@@ -338,46 +338,46 @@ def get_all_diseases() -> list:
     return list(DISEASE_INFO.keys())
 
 
-def format_report_section(disease_name: str, probability: float, 
-                          location: str = None) -> str:
+def format_report_section(disease_name: str, probability: float,
+                          location: str | None = None) -> str:
     """
     Format a clinical report section for a detected disease.
-    
+
     Args:
         disease_name: Name of the detected disease
         probability: Detection probability (0-1)
         location: Localization result from GradCAM analysis
-        
+
     Returns:
         Formatted report section
     """
     info = get_disease_info(disease_name)
-    
+
     if info is None:
         return f"Finding: {disease_name}\nConfidence: {probability:.1%}\n"
-    
+
     report = []
     report.append(f"FINDING: {info['full_name']}")
     report.append(f"Detection Confidence: {probability:.1%}")
-    
+
     if location:
         report.append(f"Approximate Location: {location}")
-    
+
     report.append(f"\nDescription:\n{info['description']}")
-    
+
     report.append("\nCommon Radiographic Findings:")
     for finding in info['radiographic_findings'][:4]:
         report.append(f"  - {finding}")
-    
+
     report.append("\nPossible Causes:")
     for cause in info['causes'][:4]:
         report.append(f"  - {cause}")
-    
+
     report.append("\nRecommended Actions:")
     for precaution in info['precautions'][:4]:
         report.append(f"  - {precaution}")
-    
+
     report.append(f"\nClinical Significance: {info['clinical_significance']}")
     report.append(f"Urgency: {info['urgency']}")
-    
+
     return "\n".join(report)

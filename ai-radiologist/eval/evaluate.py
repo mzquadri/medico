@@ -106,7 +106,7 @@ def main() -> None:
     import sys
 
     sys.path.insert(0, str(HERE.parent))
-    from model_handler import THRESHOLDS  # noqa: E402
+    from model_handler import THRESHOLDS
 
     rows = []
     for d in targets:
@@ -120,8 +120,8 @@ def main() -> None:
         t_j, j, sens_j, spec_j = best_youden(pos, neg)
         rows.append({
             "finding": d,
-            "n_positive": int(len(pos)),
-            "n_negative": int(len(neg)),
+            "n_positive": len(pos),
+            "n_negative": len(neg),
             "prevalence": float(y.mean()),
             "auroc": auroc(pos, neg),
             "auprc": auprc(pos, neg),
