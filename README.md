@@ -6,6 +6,19 @@ X-ray findings, learning from three datasets that label different subsets of the
 Alongside it, [`ai-radiologist/`](ai-radiologist/) is a screening and explainability
 demo that runs a different model.
 
+## How this got to 14 findings
+
+The work started at five findings, five of the seven that both NIH and CheXpert
+annotate, and the set the screening demo still covers. Going to all 14 is not a matter of widening the
+output layer: it is what forces the label-masking problem below, because NIH is the
+only one of the three sources that annotates all 14, CheXpert annotates 7 of them,
+and the pneumonia set annotates 1. At five findings you can mostly ignore that. At
+14 you cannot, and treating an unlabelled finding as a negative teaches the model
+something false about a large share of the corpus.
+
+So the five-to-14 step is the reason this repository exists, and the masked loss is
+the thing it is actually about.
+
 ## Two components, two different models
 
 Read this before comparing any number between them.
