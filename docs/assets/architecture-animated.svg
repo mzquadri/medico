@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1248 434" role="img" aria-label="Fourteen channels, and the ones a corpus cannot speak to">
+<title>Fourteen channels, and the ones a corpus cannot speak to</title>
+<style>
+    :root{--bg:#f7f8fa;--ink:#1c2430;--soft:#5a6675;--line:#c9d1da;--box:#ffffff;--a:#4e9a92}
+    @media(prefers-color-scheme:dark){:root{--bg:#10151c;--ink:#e6ebf2;--soft:#9fb0c2;--line:#3a4654;--box:#18202a;--a:#82c0b8}}
+    text{font-family:Archivo,'Segoe UI',Arial,sans-serif}
+    .t{fill:var(--ink);font-size:13px;font-weight:600}.n{fill:var(--soft);font-size:10.5px}.l{fill:var(--soft);font-size:10px}
+    rect.b{fill:var(--box);stroke:var(--line);stroke-width:1.2}
+    .e{fill:none;stroke:var(--a);stroke-width:1.6;stroke-dasharray:100;stroke-dashoffset:100}
+    .e.f{stroke:var(--soft)}
+    .g{opacity:0;transform-box:fill-box;transform-origin:center}
+    .p{fill:var(--a);opacity:0}
+    @keyframes draw{0%{stroke-dashoffset:100}35%,88%{stroke-dashoffset:0}100%{stroke-dashoffset:100}}
+    @keyframes rise{0%{opacity:0;transform:scale(.9)}14%,90%{opacity:1;transform:none}100%{opacity:0}}
+    @keyframes run{0%{offset-distance:0;opacity:0}5%{opacity:1}30%{opacity:1}36%,100%{offset-distance:100%;opacity:0}}
+    @keyframes lit{0%,100%{stroke:var(--line);stroke-width:1.2}50%{stroke:var(--a);stroke-width:2.6}}
+    .e{animation:draw 9s ease-in-out infinite both;animation-delay:calc(var(--i)*.14s)}
+    .g{animation:rise 9s ease-out infinite both;animation-delay:calc(var(--i)*.14s)}
+    .g rect.b{animation:lit 2.2s ease-in-out 1 both;animation-iteration-count:infinite;animation-delay:calc(var(--i)*.35s)}
+    .p{animation:run 9s linear infinite both;animation-delay:calc(1s + var(--i)*.14s)}
+    @media(prefers-reduced-motion:reduce){.e,.g,.g rect.b{animation:none;opacity:1;stroke-dashoffset:0}.p{display:none}}
+    </style>
+<defs><marker id="a" markerWidth="9" markerHeight="7" refX="8.5" refY="3.5" orient="auto"><path d="M0 0L9 3.5L0 7Z" fill="var(--a)"/></marker></defs>
+<rect width="100%" height="100%" rx="10" fill="var(--bg)"/>
+<g transform="translate(0 30)">
+<text class="t" x="26" y="-8" style="font-size:15px">Fourteen channels, and the ones a corpus cannot speak to</text>
+<path class="e" d="M 214 177 L 278 177" pathLength="100" marker-end="url(#a)" style="--i:0"/>
+<circle class="p" r="4" style="--i:0;offset-path:path('M 214 177 L 278 177')"/>
+<path class="e" d="M 466 177 L 530 177" pathLength="100" marker-end="url(#a)" style="--i:1"/>
+<circle class="p" r="4" style="--i:1;offset-path:path('M 466 177 L 530 177')"/>
+<path class="e" d="M 718 177 L 750 177 L 750 65 L 782 65" pathLength="100" marker-end="url(#a)" style="--i:2"/>
+<circle class="p" r="4" style="--i:2;offset-path:path('M 718 177 L 750 177 L 750 65 L 782 65')"/>
+<path class="e" d="M 718 177 L 750 177 L 750 289 L 782 289" pathLength="100" marker-end="url(#a)" style="--i:3"/>
+<circle class="p" r="4" style="--i:3;offset-path:path('M 718 177 L 750 177 L 750 289 L 782 289')"/>
+<path class="e" d="M 970 65 L 1002 65 L 1002 177 L 1034 177" pathLength="100" marker-end="url(#a)" style="--i:4"/>
+<circle class="p" r="4" style="--i:4;offset-path:path('M 970 65 L 1002 65 L 1002 177 L 1034 177')"/>
+<path class="e" d="M 970 289 L 1002 289 L 1002 177 L 1034 177" pathLength="100" marker-end="url(#a)" style="--i:5"/>
+<circle class="p" r="4" style="--i:5;offset-path:path('M 970 289 L 1002 289 L 1002 177 L 1034 177')"/>
+<path class="e f" d="M 876 104 L 876 362 L 120 362 L 120 216" pathLength="100" marker-end="url(#a)" style="--i:6"/>
+<circle class="p" r="4" style="--i:6;offset-path:path('M 876 104 L 876 362 L 120 362 L 120 216')"/>
+<text class="l" x="498" y="353" text-anchor="middle">silence is not absence</text>
+<g class="g" style="--i:0"><rect class="b" x="26" y="138" width="188" height="78" rx="6"/><text class="t" x="40" y="164">Three chest corpora</text>
+<text class="n" x="40" y="184">They disagree about which</text>
+<text class="n" x="40" y="197">findings they annotate at all.</text>
+</g>
+<g class="g" style="--i:1"><rect class="b" x="278" y="138" width="188" height="78" rx="6"/><text class="t" x="292" y="164">Split by patient</text>
+<text class="n" x="292" y="184">Not by image. One chest</text>
+<text class="n" x="292" y="197">appears more than once.</text>
+</g>
+<g class="g" style="--i:2"><rect class="b" x="530" y="138" width="188" height="78" rx="6"/><text class="t" x="544" y="164">Multi-label classifier</text>
+<text class="n" x="544" y="184">Fourteen finding channels,</text>
+<text class="n" x="544" y="197">each decided independently.</text>
+</g>
+<g class="g" style="--i:3"><rect class="b" x="782" y="26" width="188" height="78" rx="6"/><text class="t" x="796" y="52">Unlabelled channels masked</text>
+<text class="n" x="796" y="72">A finding a corpus cannot</text>
+<text class="n" x="796" y="85">label drops out rather than…</text>
+</g>
+<g class="g" style="--i:4"><rect class="b" x="782" y="250" width="188" height="78" rx="6"/><text class="t" x="796" y="276">Saliency</text>
+<text class="n" x="796" y="296">Where the evidence for a</text>
+<text class="n" x="796" y="309">channel was read from.</text>
+</g>
+<g class="g" style="--i:5"><rect class="b" x="1034" y="138" width="188" height="78" rx="6"/><text class="t" x="1048" y="164">No published result</text>
+<text class="n" x="1048" y="184">No trained weights, no</text>
+<text class="n" x="1048" y="197">held-out metrics, no clinical…</text>
+</g>
+</g></svg>

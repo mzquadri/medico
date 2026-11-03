@@ -1,5 +1,15 @@
 # Medico: chest X-ray multi-label training
 
+<!-- project-story:start -->
+<p align="center"><img src="docs/assets/architecture-animated.svg" alt="Animated architecture diagram of this project" width="100%"></p>
+
+| Problem | Why it mattered | Result |
+|---|---|---|
+| Three X-ray corpora label different findings. | Treating silence as a negative would teach the model something false. | **Masked** labels a corpus cannot give drop out instead of counting as negative |
+
+[See it animated on mzquadri.de](https://mzquadri.de/work/medico)
+<!-- project-story:end -->
+
 A research training script that fine-tunes a DenseNet-121 across the 14 NIH chest
 X-ray findings, learning from three datasets that label different subsets of them.
 
