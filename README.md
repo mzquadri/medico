@@ -11,8 +11,9 @@
 <!-- project-story:end -->
 
 A training script that fine-tunes a DenseNet-121 across the 14 NIH chest X-ray findings,
-learning from three datasets that label different subsets of them. It comes from an AI
-radiologist prototype built for a client.
+learning from three datasets that label different subsets of them. This is a personal
+project: the idea came from work on an AI radiologist prototype built for a client, and
+the code here was written separately.
 
 Alongside it, [`ai-radiologist/`](ai-radiologist/) is a screening and explainability
 demo that runs a different model.
