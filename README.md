@@ -10,8 +10,9 @@
 [See it animated on mzquadri.de](https://mzquadri.de/work/medico)
 <!-- project-story:end -->
 
-A research training script that fine-tunes a DenseNet-121 across the 14 NIH chest
-X-ray findings, learning from three datasets that label different subsets of them.
+A training script that fine-tunes a DenseNet-121 across the 14 NIH chest X-ray findings,
+learning from three datasets that label different subsets of them. It comes from an AI
+radiologist prototype built for a client.
 
 Alongside it, [`ai-radiologist/`](ai-radiologist/) is a screening and explainability
 demo that runs a different model.
@@ -19,7 +20,9 @@ demo that runs a different model.
 ## How this got to 14 findings
 
 The work started at five findings, five of the seven that both NIH and CheXpert
-annotate, and the set the screening demo still covers. Going to all 14 is not a matter of widening the
+annotate, and the set the screening demo still covers. Those five were completed and
+handed over, and the work then went on to all 14, trained on NIH ChestX-ray14, CheXpert
+and the pneumonia set, with the data taken from Kaggle. Going to all 14 is not a matter of widening the
 output layer: it is what forces the label-masking problem below, because NIH is the
 only one of the three sources that annotates all 14, CheXpert annotates 7 of them,
 and the pneumonia set annotates 1. At five findings you can mostly ignore that. At
@@ -50,7 +53,8 @@ This is experimental research code. It is not a clinical product, it has not bee
 clinically validated, and it must not be used for diagnosis, triage, treatment
 decisions or any other clinical purpose.
 
-**The training script publishes no performance numbers.** No trained weights and no
+**The training script publishes no performance numbers.** The model was trained at the
+company, and its weights and results stayed there. No trained weights and no
 held-out metrics for it are included here, and there are no result figures for it
 below: a score this repository cannot produce is not worth drawing.
 
